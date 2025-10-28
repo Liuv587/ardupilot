@@ -119,6 +119,14 @@ const AP_Param::GroupInfo AC_Avoid::var_info[] = {
     // @User: Standard
     AP_GROUPINFO("BACKZ_SPD", 10, AC_Avoid, _backup_speed_z_max, 0.75),
 
+    // @Param: SMOOTH_F
+    // @DisplayName: Avoidance smoothing factor
+    // @Description: EMA smoothing factor applied to avoidance output velocities. 0 disables smoothing. Range 0.0 - 0.99. Larger value => smoother (slower to change)
+    // @Units: ratio
+    // @Range: 0 0.99
+    // @User: Advanced
+    AP_GROUPINFO("SMOOTH_F", 11, AC_Avoid, _smooth_factor, 0.5f),
+
     AP_GROUPEND
 };
 
@@ -128,6 +136,40 @@ AC_Avoid::AC_Avoid()
     _singleton = this;
 
     AP_Param::setup_object_defaults(this, var_info);
+
+
+    // initialize smoothing caches
+    _prev_smooth_vel.zero();
+    _prev_smooth_vel2.zero();
+    // _smooth_factor 已由 AP_Param::setup_object_defaults 初始化为默认值（0.5）
+}
+
+// === 3) 新增平滑函数实现 ===
+
+Vector3f AC_Avoid::apply_smoothing(const Vector3f &new_vel)
+{
+    // 如果平滑因子为 0 或负值，直接返回
+    if (_smooth_factor <= 0.0f || is_zero(_smooth_factor)) {
+        _prev_smooth_vel = new_vel;
+        return new_vel;
+    }
+    const float alpha = constrain_float(_smooth_factor, 0.0f, 0.99f);
+    // EMA: out = prev*alpha + new*(1-alpha)
+    Vector3f out = _prev_smooth_vel * alpha + new_vel * (1.0f - alpha);
+    _prev_smooth_vel = out;
+    return out;
+}
+
+Vector2f AC_Avoid::apply_smoothing(const Vector2f &new_vel)
+{
+    if (_smooth_factor <= 0.0f || is_zero(_smooth_factor)) {
+        _prev_smooth_vel2 = new_vel;
+        return new_vel;
+    }
+    const float alpha = constrain_float(_smooth_factor, 0.0f, 0.99f);
+    Vector2f out = _prev_smooth_vel2 * alpha + new_vel * (1.0f - alpha);
+    _prev_smooth_vel2 = out;
+    return out;
 }
 
 /*
@@ -802,55 +844,86 @@ void AC_Avoid::adjust_velocity_circle_fence(float kP, float accel_cmss, Vector2f
 
     // vehicle is inside the circular fence
     switch (_behavior) {
-    case BEHAVIOR_SLIDE: {
-        // implement sliding behaviour
-        const Vector2f stopping_point = position_xy + desired_vel_cms*(get_stopping_distance(kP, accel_cmss, desired_speed)/desired_speed);
-        const float stopping_point_dist_from_home = stopping_point.length();
-        if (stopping_point_dist_from_home <= fence_radius - margin_cm) {
-            // stopping before before fence so no need to adjust
+        case BEHAVIOR_SLIDE: {
+            // implement sliding behaviour
+            const Vector2f stopping_point = position_xy + desired_vel_cms*(get_stopping_distance(kP, accel_cmss, desired_speed)/desired_speed);
+            const float stopping_point_dist_from_home = stopping_point.length();
+            if (stopping_point_dist_from_home <= fence_radius - margin_cm) {
+                // stopping before fence so no need to adjust
+                return;
+            }
+            
+            // unsafe desired velocity - will not be able to stop before reaching margin from fence
+            // Project stopping point radially onto fence boundary
+            // Adjusted velocity will point towards this projected point at a safe speed
+            const Vector2f target_offset = stopping_point * ((fence_radius - margin_cm) / stopping_point_dist_from_home);
+            const Vector2f target_direction = target_offset - position_xy;
+            const float distance_to_target = target_direction.length();
+            
+            if (is_positive(distance_to_target)) {
+                const float max_speed = get_max_speed(kP, accel_cmss, distance_to_target, dt);
+                desired_vel_cms = target_direction * (MIN(desired_speed, max_speed) / distance_to_target);
+
+                // 平滑并记录（desired_velocity_xy_cms 代表原始未改前的 desired horizontal velocity）
+                Vector2f desired_before = desired_vel_cms; // 保存调整后的速度（非原始速度）
+                Vector2f desired_after = apply_smoothing(desired_vel_cms);
+
+#if HAL_LOGGING_ENABLED
+                Write_SimpleAvoidance(true, Vector3f{desired_before.x, desired_before.y, 0.0f}, 
+                                     Vector3f{desired_after.x, desired_after.y, 0.0f}, false);
+#endif
+                desired_vel_cms = desired_after;
+            }
             return;
         }
-        // unsafe desired velocity - will not be able to stop before reaching margin from fence
-        // Project stopping point radially onto fence boundary
-        // Adjusted velocity will point towards this projected point at a safe speed
-        const Vector2f target_offset = stopping_point * ((fence_radius - margin_cm) / stopping_point_dist_from_home);
-        const Vector2f target_direction = target_offset - position_xy;
-        const float distance_to_target = target_direction.length();
-        if (is_positive(distance_to_target)) {
-            const float max_speed = get_max_speed(kP, accel_cmss, distance_to_target, dt);
-            desired_vel_cms = target_direction * (MIN(desired_speed,max_speed) / distance_to_target);
-        }
-      break;
-    } 
-  
-    case (BEHAVIOR_STOP): {
-        // implement stopping behaviour
-        // calculate stopping point plus a margin so we look forward far enough to intersect with circular fence
-        const Vector2f stopping_point_plus_margin = position_xy + desired_vel_cms*((2.0f + margin_cm + get_stopping_distance(kP, accel_cmss, desired_speed))/desired_speed);
-        const float stopping_point_plus_margin_dist_from_home = stopping_point_plus_margin.length();
-        if (dist_from_home >= fence_radius - margin_cm) {
-            // vehicle has already breached margin around fence
-            // if stopping point is even further from home (i.e. in wrong direction) then adjust speed to zero
-            // otherwise user is backing away from fence so do not apply limits
-            if (stopping_point_plus_margin_dist_from_home >= dist_from_home) {
-                desired_vel_cms.zero();
-            }
-        } else {
-            // shorten vector without adjusting its direction
-            Vector2f intersection;
-            if (Vector2f::circle_segment_intersection(position_xy, stopping_point_plus_margin, Vector2f(0.0f,0.0f), fence_radius - margin_cm, intersection)) {
-                const float distance_to_target = (intersection - position_xy).length();
-                const float max_speed = get_max_speed(kP, accel_cmss, distance_to_target, dt);
-                if (max_speed < desired_speed) {
-                    desired_vel_cms *= MAX(max_speed, 0.0f) / desired_speed;
+
+        case BEHAVIOR_STOP: {
+            // implement stopping behaviour
+            // calculate stopping point plus a margin so we look forward far enough to intersect with circular fence
+            const Vector2f stopping_point_plus_margin = position_xy + desired_vel_cms*((2.0f + margin_cm + get_stopping_distance(kP, accel_cmss, desired_speed))/desired_speed);
+            const float stopping_point_plus_margin_dist_from_home = stopping_point_plus_margin.length();
+            
+            // 保存原始速度用于日志记录
+            Vector2f original_desired_vel = desired_vel_cms;
+            
+            if (dist_from_home >= fence_radius - margin_cm) {
+                // vehicle has already breached margin around fence
+                // if stopping point is even further from home (i.e. in wrong direction) then adjust speed to zero
+                // otherwise user is backing away from fence so do not apply limits
+                if (stopping_point_plus_margin_dist_from_home >= dist_from_home) {
+                    desired_vel_cms.zero();
+                }
+            } else {
+                // shorten vector without adjusting its direction
+                Vector2f intersection;
+                if (Vector2f::circle_segment_intersection(position_xy, stopping_point_plus_margin, Vector2f(0.0f,0.0f), fence_radius - margin_cm, intersection)) {
+                    const float distance_to_target = (intersection - position_xy).length();
+                    const float max_speed = get_max_speed(kP, accel_cmss, distance_to_target, dt);
+                    if (max_speed < desired_speed) {
+                        desired_vel_cms *= MAX(max_speed, 0.0f) / desired_speed;
+                    }
                 }
             }
+
+            // liu -- 平滑并记录（desired_velocity_xy_cms 代表原始未改前的 desired horizontal velocity）
+            // 应用平滑处理
+            Vector2f desired_after = apply_smoothing(desired_vel_cms);
+
+#if HAL_LOGGING_ENABLED
+            Write_SimpleAvoidance(true, 
+                                 Vector3f{original_desired_vel.x, original_desired_vel.y, 0.0f},  // 原始速度
+                                 Vector3f{desired_after.x, desired_after.y, 0.0f},               // 平滑后速度
+                                 false);
+#endif
+
+            desired_vel_cms = desired_after;
+            break;
         }
-        break;
-    }
+
+        default:
+            break;
     }
 }
-
 /*
  * Adjusts the desired velocity for the exclusion polygons
  */
@@ -1321,10 +1394,27 @@ void AC_Avoid::adjust_velocity_proximity(float kP, float accel_cmss, Vector3f &d
         return;
     }
 
-    // set modified desired velocity vector and back away velocity vector
+    // // set modified desired velocity vector and back away velocity vector
+    // // vectors were in body-frame, rotate resulting vector back to earth-frame
+    // const Vector2f safe_vel_2d = _ahrs.body_to_earth2D(Vector2f{safe_vel.x, safe_vel.y});
+    // desired_vel_cms = Vector3f{safe_vel_2d.x, safe_vel_2d.y, safe_vel.z};
+    // const Vector2f backup_vel_xy = _ahrs.body_to_earth2D(desired_back_vel_cms_xy);
+    // backup_vel = Vector3f{backup_vel_xy.x, backup_vel_xy.y, desired_back_vel_cms_z};
+
+     // 平滑 safe_vel（body-frame）
+    const Vector3f safe_vel_before = safe_vel;
+    safe_vel = apply_smoothing(safe_vel);
+
+#if HAL_LOGGING_ENABLED
+    // 记录原始 safe_vel 与平滑后 safe_vel，backing_up 由上层逻辑决定（这里用 backing_up 变量传入的值）
+    // 这里复用 Write_SimpleAvoidance(bool active, Vector3f orig, Vector3f modified, bool backing_up)
+    Write_SimpleAvoidance(true, safe_vel_before, safe_vel, false);
+#endif
+
     // vectors were in body-frame, rotate resulting vector back to earth-frame
     const Vector2f safe_vel_2d = _ahrs.body_to_earth2D(Vector2f{safe_vel.x, safe_vel.y});
     desired_vel_cms = Vector3f{safe_vel_2d.x, safe_vel_2d.y, safe_vel.z};
+
     const Vector2f backup_vel_xy = _ahrs.body_to_earth2D(desired_back_vel_cms_xy);
     backup_vel = Vector3f{backup_vel_xy.x, backup_vel_xy.y, desired_back_vel_cms_z};
 #endif // HAL_PROXIMITY_ENABLED
@@ -1442,9 +1532,22 @@ void AC_Avoid::adjust_velocity_polygon(float kP, float accel_cmss, Vector2f &des
     // desired backup velocity is sum of maximum velocity component in each quadrant 
     desired_back_vel_cms = quad_1_back_vel + quad_2_back_vel + quad_3_back_vel + quad_4_back_vel;
 
-    // set modified desired velocity vector or back away velocity vector
+    // // set modified desired velocity vector or back away velocity vector
+    // desired_vel_cms = safe_vel;
+    // backup_vel = desired_back_vel_cms;
+
+     // 平滑 2D safe_vel（以避免突变）
+    const Vector2f safe_vel_before2 = safe_vel;
+    safe_vel = apply_smoothing(safe_vel);
+
+#if HAL_LOGGING_ENABLED
+    // 写入日志（将 2D 向量扩展为 3D 以复用 Write_SimpleAvoidance 接口）
+    Write_SimpleAvoidance(true, Vector3f{safe_vel_before2.x, safe_vel_before2.y, 0.0f}, Vector3f{safe_vel.x, safe_vel.y, 0.0f}, false);
+#endif
+
     desired_vel_cms = safe_vel;
     backup_vel = desired_back_vel_cms;
+
 }
 
 /*

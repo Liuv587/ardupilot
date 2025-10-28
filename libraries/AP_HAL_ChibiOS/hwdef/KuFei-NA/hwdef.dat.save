@@ -14,8 +14,7 @@ FLASH_SIZE_KB 2048
 # with 2M flash we can afford to optimize for speed
 env OPTIMIZE -O2
 
-# ChibiOS system timer
-STM32_ST_USE_TIMER 2
+# ChibiOS system timerSTM32_ST_USE_TIMER 2
 
 # bootloader takes first sector
 FLASH_RESERVE_START_KB 128
@@ -342,15 +341,4 @@ define DEFAULT_SERIAL2_PROTOCOL 2
 define DEFAULT_SERIAL2_BAUD 115
 
 
-# Enable shell support for Mavlink console
-define HAL_HAVE_SHELL 1
 
-# Enable avoidance and proximity sensor support
-define AP_AVOIDANCE_ENABLED 1
-define HAL_PROXIMITY_ENABLED 1
-# Enable shell support for Mavlink console
-define HAL_HAVE_SHELL 1
-
-# Enable avoidance and proximity sensor support
-define AP_AVOIDANCE_ENABLED 1
-define HAL_PROXIMITY_ENABLED 1
