@@ -49,10 +49,6 @@ public:
     // kP, accel_cmss are for the horizontal axis
     // kP_z, accel_cmss_z are for vertical axis
     void adjust_velocity(Vector3f &desired_vel_cms, bool &backing_up, float kP, float accel_cmss, float kP_z, float accel_cmss_z, float dt);
-    void adjust_velocity(Vector3f &desired_vel_cms, float kP, float accel_cmss, float kP_z, float accel_cmss_z, float dt) {
-        bool backing_up = false;
-        adjust_velocity(desired_vel_cms, backing_up, kP, accel_cmss, kP_z, accel_cmss_z, dt);
-    }
 
     // This method limits velocity and calculates backaway velocity from various supported fences
     // Also limits vertical velocity using adjust_velocity_z method
