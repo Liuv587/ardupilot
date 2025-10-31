@@ -137,9 +137,9 @@ AC_Avoid::AC_Avoid()
 
     AP_Param::setup_object_defaults(this, var_info);
 
-
+    // liu -- 初始化平滑速度缓存            
     // initialize smoothing caches
-    _prev_smooth_vel.zero();
+    _prev_smooth_vel.zero();            // 初始化平滑速度缓存为零向量
     _prev_smooth_vel2.zero();
     // _smooth_factor 已由 AP_Param::setup_object_defaults 初始化为默认值（0.5）
 }
@@ -154,7 +154,8 @@ Vector3f AC_Avoid::apply_smoothing(const Vector3f &new_vel)
         return new_vel;
     }
     const float alpha = constrain_float(_smooth_factor, 0.0f, 0.99f);
-    // EMA: out = prev*alpha + new*(1-alpha)
+    // EMA: out = prev*alpha + new*(1-alpha) 
+    // 计算平滑后的速度：out = 上一帧速度 * alpha + 新速度 * (1 - alpha)
     Vector3f out = _prev_smooth_vel * alpha + new_vel * (1.0f - alpha);
     _prev_smooth_vel = out;
     return out;
@@ -164,13 +165,13 @@ Vector2f AC_Avoid::apply_smoothing(const Vector2f &new_vel)
 {
     if (_smooth_factor <= 0.0f || is_zero(_smooth_factor)) {
         _prev_smooth_vel2 = new_vel;
-        return new_vel;
+        return new_vel;                                     
     }
     const float alpha = constrain_float(_smooth_factor, 0.0f, 0.99f);
     Vector2f out = _prev_smooth_vel2 * alpha + new_vel * (1.0f - alpha);
-    _prev_smooth_vel2 = out;
-    return out;
-}
+    _prev_smooth_vel2 = out;            
+    return out; // 返回平滑后的速度
+}   
 
 /*
 * This method limits velocity and calculates backaway velocity from various supported fences
