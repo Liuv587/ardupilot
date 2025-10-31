@@ -137,41 +137,56 @@ AC_Avoid::AC_Avoid()
 
     AP_Param::setup_object_defaults(this, var_info);
 
-    // liu -- 初始化平滑速度缓存            
+
     // initialize smoothing caches
-    _prev_smooth_vel.zero();            // 初始化平滑速度缓存为零向量
-    _prev_smooth_vel2.zero();
+    _smooth_earth_vel3.zero();
+    _smooth_earth_vel2.zero();
+    _smooth_earth_vel3_valid = false;
+    _smooth_earth_vel2_valid = false;
     // _smooth_factor 已由 AP_Param::setup_object_defaults 初始化为默认值（0.5）
 }
 
-// === 3) 新增平滑函数实现 ===
+// === 3) 平滑函数实现 ===
 
-Vector3f AC_Avoid::apply_smoothing(const Vector3f &new_vel)
+void AC_Avoid::reset_smoothing()
 {
-    // 如果平滑因子为 0 或负值，直接返回
-    if (_smooth_factor <= 0.0f || is_zero(_smooth_factor)) {
-        _prev_smooth_vel = new_vel;
-        return new_vel;
-    }
-    const float alpha = constrain_float(_smooth_factor, 0.0f, 0.99f);
-    // EMA: out = prev*alpha + new*(1-alpha) 
-    // 计算平滑后的速度：out = 上一帧速度 * alpha + 新速度 * (1 - alpha)
-    Vector3f out = _prev_smooth_vel * alpha + new_vel * (1.0f - alpha);
-    _prev_smooth_vel = out;
-    return out;
+    _smooth_earth_vel3_valid = false;
+    _smooth_earth_vel2_valid = false;
 }
 
-Vector2f AC_Avoid::apply_smoothing(const Vector2f &new_vel)
+template <typename VecType>
+static VecType avoid_apply_smoothing(const VecType &new_vel,
+                                     VecType &cache,
+                                     bool &cache_valid,
+                                     float smooth_factor)
 {
-    if (_smooth_factor <= 0.0f || is_zero(_smooth_factor)) {
-        _prev_smooth_vel2 = new_vel;
-        return new_vel;                                     
+    if (!cache_valid || smooth_factor <= 0.0f || is_zero(smooth_factor)) {
+        cache = new_vel;
+        cache_valid = true;
+        return new_vel;
     }
-    const float alpha = constrain_float(_smooth_factor, 0.0f, 0.99f);
-    Vector2f out = _prev_smooth_vel2 * alpha + new_vel * (1.0f - alpha);
-    _prev_smooth_vel2 = out;            
-    return out; // 返回平滑后的速度
-}   
+
+    const float alpha = constrain_float(smooth_factor, 0.0f, 0.99f);
+
+    cache = cache * alpha + new_vel * (1.0f - alpha);
+    return cache;
+}
+
+Vector3f AC_Avoid::apply_smoothing_earth(const Vector3f &new_vel, bool reset_cache)
+{
+    if (reset_cache) {
+        _smooth_earth_vel3_valid = false;
+    }
+    return avoid_apply_smoothing(new_vel, _smooth_earth_vel3, _smooth_earth_vel3_valid, _smooth_factor);
+}
+
+Vector2f AC_Avoid::apply_smoothing_earth(const Vector2f &new_vel, bool reset_cache)
+{
+    if (reset_cache) {
+        _smooth_earth_vel2_valid = false;
+    }
+    return avoid_apply_smoothing(new_vel, _smooth_earth_vel2, _smooth_earth_vel2_valid, _smooth_factor);
+}
 
 /*
 * This method limits velocity and calculates backaway velocity from various supported fences
@@ -865,13 +880,15 @@ void AC_Avoid::adjust_velocity_circle_fence(float kP, float accel_cmss, Vector2f
                 const float max_speed = get_max_speed(kP, accel_cmss, distance_to_target, dt);
                 desired_vel_cms = target_direction * (MIN(desired_speed, max_speed) / distance_to_target);
 
-                // 平滑并记录（desired_velocity_xy_cms 代表原始未改前的 desired horizontal velocity）
-                Vector2f desired_before = desired_vel_cms; // 保存调整后的速度（非原始速度）
-                Vector2f desired_after = apply_smoothing(desired_vel_cms);
+                Vector2f desired_before = desired_vel_cms;
+                const bool reset_smooth = !limits_active();
+                Vector2f desired_after = apply_smoothing_earth(desired_before, reset_smooth);
 
 #if HAL_LOGGING_ENABLED
-                Write_SimpleAvoidance(true, Vector3f{desired_before.x, desired_before.y, 0.0f}, 
-                                     Vector3f{desired_after.x, desired_after.y, 0.0f}, false);
+                Write_SimpleAvoidance(true,
+                                     Vector3f{desired_before.x, desired_before.y, 0.0f},
+                                     Vector3f{desired_after.x, desired_after.y, 0.0f},
+                                     false);
 #endif
                 desired_vel_cms = desired_after;
             }
@@ -906,14 +923,13 @@ void AC_Avoid::adjust_velocity_circle_fence(float kP, float accel_cmss, Vector2f
                 }
             }
 
-            // liu -- 平滑并记录（desired_velocity_xy_cms 代表原始未改前的 desired horizontal velocity）
-            // 应用平滑处理
-            Vector2f desired_after = apply_smoothing(desired_vel_cms);
+            const bool reset_smooth = !limits_active();
+            Vector2f desired_after = apply_smoothing_earth(desired_vel_cms, reset_smooth);
 
 #if HAL_LOGGING_ENABLED
             Write_SimpleAvoidance(true, 
-                                 Vector3f{original_desired_vel.x, original_desired_vel.y, 0.0f},  // 原始速度
-                                 Vector3f{desired_after.x, desired_after.y, 0.0f},               // 平滑后速度
+                                 Vector3f{original_desired_vel.x, original_desired_vel.y, 0.0f},
+                                 Vector3f{desired_after.x, desired_after.y, 0.0f},
                                  false);
 #endif
 
@@ -1395,26 +1411,18 @@ void AC_Avoid::adjust_velocity_proximity(float kP, float accel_cmss, Vector3f &d
         return;
     }
 
-    // // set modified desired velocity vector and back away velocity vector
-    // // vectors were in body-frame, rotate resulting vector back to earth-frame
-    // const Vector2f safe_vel_2d = _ahrs.body_to_earth2D(Vector2f{safe_vel.x, safe_vel.y});
-    // desired_vel_cms = Vector3f{safe_vel_2d.x, safe_vel_2d.y, safe_vel.z};
-    // const Vector2f backup_vel_xy = _ahrs.body_to_earth2D(desired_back_vel_cms_xy);
-    // backup_vel = Vector3f{backup_vel_xy.x, backup_vel_xy.y, desired_back_vel_cms_z};
-
-     // 平滑 safe_vel（body-frame）
-    const Vector3f safe_vel_before = safe_vel;
-    safe_vel = apply_smoothing(safe_vel);
-
-#if HAL_LOGGING_ENABLED
-    // 记录原始 safe_vel 与平滑后 safe_vel，backing_up 由上层逻辑决定（这里用 backing_up 变量传入的值）
-    // 这里复用 Write_SimpleAvoidance(bool active, Vector3f orig, Vector3f modified, bool backing_up)
-    Write_SimpleAvoidance(true, safe_vel_before, safe_vel, false);
-#endif
-
     // vectors were in body-frame, rotate resulting vector back to earth-frame
     const Vector2f safe_vel_2d = _ahrs.body_to_earth2D(Vector2f{safe_vel.x, safe_vel.y});
-    desired_vel_cms = Vector3f{safe_vel_2d.x, safe_vel_2d.y, safe_vel.z};
+    Vector3f safe_vel_earth{safe_vel_2d.x, safe_vel_2d.y, safe_vel.z};
+
+    const bool reset_smooth = !limits_active();
+    Vector3f safe_vel_smoothed = apply_smoothing_earth(safe_vel_earth, reset_smooth);
+
+#if HAL_LOGGING_ENABLED
+    Write_SimpleAvoidance(true, safe_vel_earth, safe_vel_smoothed, false);
+#endif
+
+    desired_vel_cms = safe_vel_smoothed;
 
     const Vector2f backup_vel_xy = _ahrs.body_to_earth2D(desired_back_vel_cms_xy);
     backup_vel = Vector3f{backup_vel_xy.x, backup_vel_xy.y, desired_back_vel_cms_z};
@@ -1538,12 +1546,16 @@ void AC_Avoid::adjust_velocity_polygon(float kP, float accel_cmss, Vector2f &des
     // backup_vel = desired_back_vel_cms;
 
      // 平滑 2D safe_vel（以避免突变）
+    const bool reset_smooth = !limits_active();
     const Vector2f safe_vel_before2 = safe_vel;
-    safe_vel = apply_smoothing(safe_vel);
+    safe_vel = apply_smoothing_earth(safe_vel_before2, reset_smooth);
 
 #if HAL_LOGGING_ENABLED
     // 写入日志（将 2D 向量扩展为 3D 以复用 Write_SimpleAvoidance 接口）
-    Write_SimpleAvoidance(true, Vector3f{safe_vel_before2.x, safe_vel_before2.y, 0.0f}, Vector3f{safe_vel.x, safe_vel.y, 0.0f}, false);
+    Write_SimpleAvoidance(true,
+                          Vector3f{safe_vel_before2.x, safe_vel_before2.y, 0.0f},
+                          Vector3f{safe_vel.x, safe_vel.y, 0.0f},
+                          false);
 #endif
 
     desired_vel_cms = safe_vel;

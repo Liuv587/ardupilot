@@ -109,9 +109,10 @@ public:
 
     static const struct AP_Param::GroupInfo var_info[];
 
-        // 平滑函数：对输出速度做简单 EMA 平滑以减少突变
-    Vector3f apply_smoothing(const Vector3f &new_vel);
-    Vector2f apply_smoothing(const Vector2f &new_vel);
+    // 平滑函数：对输出速度做简单 EMA 平滑以减少突变
+    Vector3f apply_smoothing_earth(const Vector3f &new_vel, bool reset_cache = false);
+    Vector2f apply_smoothing_earth(const Vector2f &new_vel, bool reset_cache = false);
+    void reset_smoothing();
 
 private:
     // behaviour types (see BEHAVE parameter)
@@ -231,9 +232,11 @@ private:
     // 平滑因子（0.0 = 关闭，0.99 = 很强的平滑）
     AP_Float _smooth_factor;
 
-    // 平滑缓存（3D 与 2D 分别缓存）
-    Vector3f _prev_smooth_vel;
-    Vector2f _prev_smooth_vel2;
+    // 平滑缓存（地理系 3D 与 2D 分别缓存）
+    Vector3f _smooth_earth_vel3;
+    Vector2f _smooth_earth_vel2;
+    bool _smooth_earth_vel3_valid;
+    bool _smooth_earth_vel2_valid;
 };
 
 namespace AP {
