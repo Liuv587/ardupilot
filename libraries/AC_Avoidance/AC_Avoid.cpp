@@ -25,6 +25,7 @@
 #include <AP_Logger/AP_Logger.h>
 #include <AP_Vehicle/AP_Vehicle_Type.h>
 #include <stdio.h>
+#include <algorithm>
 
 #if !APM_BUILD_TYPE(APM_BUILD_ArduPlane)
 
@@ -143,6 +144,16 @@ AC_Avoid::AC_Avoid()
     _smooth_earth_vel2.zero();
     _smooth_earth_vel3_valid = false;
     _smooth_earth_vel2_valid = false;
+
+    for (uint8_t i = 0; i < PROXIMITY_MEDIAN_OBS_MAX; i++) {
+        ProximityMedianFilter &filter = _proximity_median_filters[i];
+        for (uint8_t j = 0; j < PROXIMITY_MEDIAN_WINDOW; j++) {
+            filter.history[j] = 0.0f;
+        }
+        filter.index = 0;
+        filter.count = 0;
+        filter.last_update_ms = 0;
+    }
     // _smooth_factor 已由 AP_Param::setup_object_defaults 初始化为默认值（0.5）
 }
 
@@ -152,6 +163,58 @@ void AC_Avoid::reset_smoothing()
 {
     _smooth_earth_vel3_valid = false;
     _smooth_earth_vel2_valid = false;
+}
+
+// === 4) Proximity 中值滤波实现 ===
+
+float AC_Avoid::apply_proximity_median_filter(uint8_t obstacle_num, float distance_m)
+{
+    // 检查索引有效性
+    if (obstacle_num >= PROXIMITY_MEDIAN_OBS_MAX) {
+        return distance_m;
+    }
+
+    ProximityMedianFilter &filter = _proximity_median_filters[obstacle_num];
+    const uint32_t now_ms = AP_HAL::millis();
+
+    // 如果超过 PROXIMITY_MEDIAN_RESET_MS 未更新，重置滤波器
+    if ((now_ms - filter.last_update_ms) > PROXIMITY_MEDIAN_RESET_MS) {
+        filter.count = 0;
+        filter.index = 0;
+    }
+
+    // 添加新样本到环形缓冲区
+    filter.history[filter.index] = distance_m;
+    filter.index = (filter.index + 1) % PROXIMITY_MEDIAN_WINDOW;
+    if (filter.count < PROXIMITY_MEDIAN_WINDOW) {
+        filter.count++;
+    }
+    filter.last_update_ms = now_ms;
+
+    // 如果样本不足，直接返回原值
+    if (filter.count == 0) {
+        return distance_m;
+    }
+
+    // 复制有效样本到临时数组并排序
+    float sorted[PROXIMITY_MEDIAN_WINDOW];
+    for (uint8_t i = 0; i < filter.count; i++) {
+        sorted[i] = filter.history[i];
+    }
+
+    // 简单冒泡排序（窗口小，性能影响可忽略）
+    for (uint8_t i = 0; i < filter.count - 1; i++) {
+        for (uint8_t j = 0; j < filter.count - i - 1; j++) {
+            if (sorted[j] > sorted[j + 1]) {
+                float temp = sorted[j];
+                sorted[j] = sorted[j + 1];
+                sorted[j + 1] = temp;
+            }
+        }
+    }
+
+    // 返回中值
+    return sorted[filter.count / 2];
 }
 
 template <typename VecType>
@@ -1331,9 +1394,21 @@ void AC_Avoid::adjust_velocity_proximity(float kP, float accel_cmss, Vector3f &d
             continue;
         }
 
-        const float dist_to_boundary = vector_to_obstacle.length();
+        const float dist_to_boundary_raw = vector_to_obstacle.length();
+        if (is_zero(dist_to_boundary_raw)) {
+            continue;
+        }
+
+        // 应用中值滤波过滤距离噪声（单位：m）
+        const float dist_to_boundary = apply_proximity_median_filter(i, dist_to_boundary_raw / 100.0f) * 100.0f;
         if (is_zero(dist_to_boundary)) {
             continue;
+        }
+
+        // 根据滤波后的距离重新缩放障碍向量
+        if (!is_zero(dist_to_boundary_raw) && fabsf(dist_to_boundary - dist_to_boundary_raw) > 1e-3f) {
+            const float scale = dist_to_boundary / dist_to_boundary_raw;
+            vector_to_obstacle *= scale;
         }
 
         // back away if vehicle has breached margin

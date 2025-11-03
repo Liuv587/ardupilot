@@ -8,6 +8,7 @@
 #include <AP_Param/AP_Param.h>
 #include <AP_Math/AP_Math.h>
 #include <AC_AttitudeControl/AC_AttitudeControl.h> // Attitude controller library for sqrt controller
+#include <AP_Proximity/AP_Proximity_Boundary_3D.h>
 
 #define AC_AVOID_ACCEL_CMSS_MAX         100.0f  // maximum acceleration/deceleration in cm/s/s used to avoid hitting fence
 
@@ -114,12 +115,14 @@ public:
     Vector2f apply_smoothing_earth(const Vector2f &new_vel, bool reset_cache = false);
     void reset_smoothing();
 
+    // Proximity 中值滤波：对障碍距离做中值滤波以过滤尖峰噪声
+    float apply_proximity_median_filter(uint8_t obstacle_num, float distance_m);
+
 private:
     // behaviour types (see BEHAVE parameter)
     enum BehaviourType {
         BEHAVIOR_SLIDE = 0,
-        BEHAVIOR_STOP = 1,
-        BEHAVIOR_SMOOTH_STOP = 2
+        BEHAVIOR_STOP = 1
     };
 
     /*
@@ -237,6 +240,20 @@ private:
     Vector2f _smooth_earth_vel2;
     bool _smooth_earth_vel3_valid;
     bool _smooth_earth_vel2_valid;
+
+    // Proximity 中值滤波
+    static constexpr uint8_t PROXIMITY_MEDIAN_WINDOW = 5;
+    static constexpr uint8_t PROXIMITY_MEDIAN_OBS_MAX = 24;  // PROXIMITY_NUM_SECTORS(8) * PROXIMITY_NUM_LAYERS(3)
+    static constexpr uint32_t PROXIMITY_MEDIAN_RESET_MS = 500U;
+
+    struct ProximityMedianFilter {
+        float history[PROXIMITY_MEDIAN_WINDOW];
+        uint8_t index;
+        uint8_t count;
+        uint32_t last_update_ms;
+    };
+
+    ProximityMedianFilter _proximity_median_filters[PROXIMITY_MEDIAN_OBS_MAX];
 };
 
 namespace AP {
