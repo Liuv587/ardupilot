@@ -242,7 +242,7 @@ private:
     bool _smooth_earth_vel2_valid;
 
     // Proximity 中值滤波
-    static constexpr uint8_t PROXIMITY_MEDIAN_WINDOW = 5;
+    static constexpr uint8_t PROXIMITY_MEDIAN_WINDOW = 11;
     static constexpr uint8_t PROXIMITY_MEDIAN_OBS_MAX = 24;  // PROXIMITY_NUM_SECTORS(8) * PROXIMITY_NUM_LAYERS(3)
     static constexpr uint32_t PROXIMITY_MEDIAN_RESET_MS = 500U;
 
@@ -251,6 +251,7 @@ private:
         uint8_t index;
         uint8_t count;
         uint32_t last_update_ms;
+        float last_valid_distance;  // 上一个有效距离，用于异常值检测
     };
 
     ProximityMedianFilter _proximity_median_filters[PROXIMITY_MEDIAN_OBS_MAX];

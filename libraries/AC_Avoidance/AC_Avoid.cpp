@@ -153,6 +153,7 @@ AC_Avoid::AC_Avoid()
         filter.index = 0;
         filter.count = 0;
         filter.last_update_ms = 0;
+        filter.last_valid_distance = 0.0f;
     }
     // _smooth_factor 已由 AP_Param::setup_object_defaults 初始化为默认值（0.5）
 }
@@ -181,6 +182,17 @@ float AC_Avoid::apply_proximity_median_filter(uint8_t obstacle_num, float distan
     if ((now_ms - filter.last_update_ms) > PROXIMITY_MEDIAN_RESET_MS) {
         filter.count = 0;
         filter.index = 0;
+        filter.last_valid_distance = distance_m;  // 保存最后一个有效距离
+    }
+
+    // 简单的异常值检测：如果距离变化太大，使用上一个有效值
+    const float max_distance_change = 8.0f;  // 米，最大允许的变化
+    if (filter.count > 0 && fabsf(distance_m - filter.last_valid_distance) > max_distance_change) {
+        // 异常值，使用上一个有效值
+        distance_m = filter.last_valid_distance;
+    } else {
+        // 更新有效值
+        filter.last_valid_distance = distance_m;
     }
 
     // 添加新样本到环形缓冲区
@@ -191,18 +203,13 @@ float AC_Avoid::apply_proximity_median_filter(uint8_t obstacle_num, float distan
     }
     filter.last_update_ms = now_ms;
 
-    // 如果样本不足，直接返回原值
-    if (filter.count == 0) {
-        return distance_m;
-    }
-
     // 复制有效样本到临时数组并排序
     float sorted[PROXIMITY_MEDIAN_WINDOW];
     for (uint8_t i = 0; i < filter.count; i++) {
         sorted[i] = filter.history[i];
     }
 
-    // 简单冒泡排序（窗口小，性能影响可忽略）
+    // 简单冒泡排序（窗口适中，性能影响可接受）
     for (uint8_t i = 0; i < filter.count - 1; i++) {
         for (uint8_t j = 0; j < filter.count - i - 1; j++) {
             if (sorted[j] > sorted[j + 1]) {
@@ -213,8 +220,15 @@ float AC_Avoid::apply_proximity_median_filter(uint8_t obstacle_num, float distan
         }
     }
 
-    // 返回中值
-    return sorted[filter.count / 2];
+    // 计算中值：对于偶数样本数，使用两个中间值的平均值
+    const uint8_t mid_index = filter.count / 2;
+    if (filter.count % 2 == 0) {
+        // 偶数：两个中间值的平均
+        return (sorted[mid_index - 1] + sorted[mid_index]) * 0.5f;
+    } else {
+        // 奇数：直接取中间值
+        return sorted[mid_index];
+    }
 }
 
 template <typename VecType>
@@ -1404,6 +1418,8 @@ void AC_Avoid::adjust_velocity_proximity(float kP, float accel_cmss, Vector3f &d
         if (is_zero(dist_to_boundary)) {
             continue;
         }
+
+        
 
         // 根据滤波后的距离重新缩放障碍向量
         if (!is_zero(dist_to_boundary_raw) && fabsf(dist_to_boundary - dist_to_boundary_raw) > 1e-3f) {
