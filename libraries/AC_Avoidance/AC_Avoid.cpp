@@ -204,7 +204,8 @@ float AC_Avoid::apply_proximity_median_filter(uint8_t obstacle_num, float distan
     filter.last_update_ms = now_ms;
 
     // 复制有效样本到临时数组并排序
-    float sorted[PROXIMITY_MEDIAN_WINDOW];
+    // 将数组零初始化，避免编译器关于“可能未初始化使用”的告警
+    float sorted[PROXIMITY_MEDIAN_WINDOW] = {};
     for (uint8_t i = 0; i < filter.count; i++) {
         sorted[i] = filter.history[i];
     }
@@ -218,6 +219,11 @@ float AC_Avoid::apply_proximity_median_filter(uint8_t obstacle_num, float distan
                 sorted[j + 1] = temp;
             }
         }
+    }
+
+    // 如果当前没有有效样本，直接返回当前测量值
+    if (filter.count == 0) {
+        return distance_m;
     }
 
     // 计算中值：对于偶数样本数，使用两个中间值的平均值

@@ -24,7 +24,7 @@ bool ModeAuto::init(bool ignore_checks)
 {
     auto_RTL = false;
     if (mission.num_commands() > 1 || ignore_checks) {
-        // reject switching to auto mode if landed with motors armed but first command is not a takeoff (reduce chance of flips)
+        // 如果电机已解锁且飞机已判定着陆，但首条指令不是起飞，则拒绝切换到自动模式（降低翻机风险）
         if (motors->armed() && copter.ap.land_complete && !mission.starts_with_takeoff_cmd()) {
             gcs().send_text(MAV_SEVERITY_CRITICAL, "Auto: Missing Takeoff Cmd");
             return false;
@@ -32,32 +32,32 @@ bool ModeAuto::init(bool ignore_checks)
 
         _mode = SubMode::LOITER;
 
-        // stop ROI from carrying over from previous runs of the mission
-        // To-Do: reset the yaw as part of auto_wp_start when the previous command was not a wp command to remove the need for this special ROI check
+        // 防止上一阶段任务的 ROI 设置遗留到本次任务
+        // TODO: 如果上一条指令不是航点指令，考虑在 auto_wp_start 中重置偏航，以免需要在此进行额外 ROI 检查
         if (auto_yaw.mode() == AutoYaw::Mode::ROI) {
             auto_yaw.set_mode(AutoYaw::Mode::HOLD);
         }
 
-        // initialise waypoint and spline controller
+        // 初始化航点与样条控制器
         wp_nav->wp_and_spline_init();
 
-        // initialise desired speed overrides
+        // 初始化期望速度覆盖量
         desired_speed_override = {0, 0, 0};
 
-        // set flag to start mission
+        // 设置标记以启动任务
         waiting_to_start = true;
 
-        // initialise mission change check (ignore results)
+        // 初始化任务修改检测（忽略返回结果）
         IGNORE_RETURN(mis_change_detector.check_for_mission_change());
 
-        // clear guided limits
+        // 清除 Guided 模式限值
         copter.mode_guided.limit_clear();
 
-        // reset flag indicating if pilot has applied roll or pitch inputs during landing
+        // 重置指示飞手在降落期间是否输入横滚/俯仰的标志位
         copter.ap.land_repo_active = false;
 
 #if AC_PRECLAND_ENABLED
-        // initialise precland state machine
+        // 初始化精确降落状态机
         copter.precland_statemachine.init();
 #endif
 
@@ -84,27 +84,27 @@ void ModeAuto::exit()
 //      should be called at 100hz or more
 void ModeAuto::run()
 {
-    // start or update mission
+    // 启动或更新任务
     if (waiting_to_start) {
-        // don't start the mission until we have an origin
+        // 在没有原点（坐标参考）前不启动任务
         Location loc;
         if (copter.ahrs.get_origin(loc)) {
-            // start/resume the mission (based on MIS_RESTART parameter)
+            // 根据 MIS_RESTART 参数启动或恢复任务
             mission.start_or_resume();
             waiting_to_start = false;
 
-            // initialise mission change check (ignore results)
+            // 初始化任务修改检测（忽略返回结果）
             IGNORE_RETURN(mis_change_detector.check_for_mission_change());
         }
     } else {
-        // check for mission changes
+        // 检查任务是否发生变化
         if (mis_change_detector.check_for_mission_change()) {
-            // if mission is running restart the current command if it is a waypoint or spline command
+            // 若任务正在运行且当前指令为航点或样条命令，则尝试重启该指令
             if ((mission.state() == AP_Mission::MISSION_RUNNING) && (_mode == SubMode::WP)) {
                 if (mission.restart_current_nav_cmd()) {
                     gcs().send_text(MAV_SEVERITY_CRITICAL, "Auto mission changed, restarted command");
                 } else {
-                    // failed to restart mission for some reason
+                    // 因未知原因导致重启失败
                     gcs().send_text(MAV_SEVERITY_CRITICAL, "Auto mission changed but failed to restart command");
                 }
             }
@@ -113,7 +113,7 @@ void ModeAuto::run()
         mission.update();
     }
 
-    // call the correct auto controller
+    // 调用对应的自动控制器
     switch (_mode) {
 
     case SubMode::TAKEOFF:
@@ -163,11 +163,11 @@ void ModeAuto::run()
         break;
     }
 
-    // only pretend to be in auto RTL so long as mission still thinks its in a landing sequence or the mission has completed
+    // 仅当任务仍处于返航或降落阶段，或任务已完成时，才维持 AUTO RTL 的伪状态
     const bool auto_rtl_active = mission.get_in_landing_sequence_flag() || mission.get_in_return_path_flag() || mission.state() == AP_Mission::mission_state::MISSION_COMPLETE;
     if (auto_RTL && !auto_rtl_active) {
         auto_RTL = false;
-        // log exit from Auto RTL
+        // 记录退出 AUTO RTL 的日志
 #if HAL_LOGGING_ENABLED
         copter.logger.Write_Mode((uint8_t)copter.flightmode->mode_number(), ModeReason::AUTO_RTL_EXIT);
 #endif
