@@ -240,7 +240,7 @@ void AP_Mission::resume()
         }
     }
 
-    // MIS_RESUME_MODE=2：优先检查断点恢复（在读取命令缓存之前）
+    // MIS_RESUME_MODE=2：先检查断点恢复（在读取命令缓存之前）
     if (_resume_mode == 2 && _breakpoint_valid && !_flags.resuming_mission &&
         _breakpoint_nav_cmd.index != AP_MISSION_CMD_INDEX_NONE) {
 
