@@ -25,9 +25,21 @@ bool ModeAuto::init(bool ignore_checks)
     auto_RTL = false;
     if (mission.num_commands() > 1 || ignore_checks) {
         // 如果电机已解锁且飞机已判定着陆，但首条指令不是起飞，则拒绝切换到自动模式（降低翻机风险）
+        // 例外：在断点恢复模式（MIS_RESUME_MODE=2）下，如果有有效断点，允许切换（系统会自动生成起飞指令）
         if (motors->armed() && copter.ap.land_complete && !mission.starts_with_takeoff_cmd()) {
-            gcs().send_text(MAV_SEVERITY_CRITICAL, "Auto: Missing Takeoff Cmd");
-            return false;
+            // 检查是否为断点恢复模式且有有效断点
+            if (mission.resume_mode() == 2) {
+                if (mission.has_breakpoint()) {
+                    gcs().send_text(MAV_SEVERITY_INFO, "Auto: Breakpoint resume mode, will auto-takeoff");
+                } else {
+                    gcs().send_text(MAV_SEVERITY_WARNING, "Auto: No valid breakpoint found, trying to continue anyway");
+                    // 即使没有断点，在断点恢复模式下也允许尝试恢复任务
+                    // 系统会在resume()函数中决定如何处理
+                }
+            } else {
+                gcs().send_text(MAV_SEVERITY_CRITICAL, "Auto: Missing Takeoff Cmd (set MIS_RESUME_MODE=2 for breakpoint resume)");
+                return false;
+            }
         }
 
         _mode = SubMode::LOITER;
@@ -71,7 +83,28 @@ bool ModeAuto::init(bool ignore_checks)
 void ModeAuto::exit()
 {
     if (copter.mode_auto.mission.state() == AP_Mission::MISSION_RUNNING) {
+        if (copter.mode_auto.mission.resume_mode() == 2 &&
+            copter.current_loc.initialised()) {
+            // 创建一个使用ABOVE_HOME参考系的位置
+            Location breakpoint_loc = copter.current_loc;
+            // 确保使用相对高度（ABOVE_HOME）
+            if (!breakpoint_loc.change_alt_frame(Location::AltFrame::ABOVE_HOME)) {
+                gcs().send_text(MAV_SEVERITY_WARNING, "Auto: Failed to convert breakpoint altitude frame");
+            }
+            copter.mode_auto.mission.set_breakpoint(breakpoint_loc);
+        }
+
+        copter.mode_auto.mission.reset_return_state();
         copter.mode_auto.mission.stop();
+    } else if (copter.mode_auto.mission.resume_mode() == 2 && 
+               copter.current_loc.initialised() &&
+               copter.mode_auto.mission.get_current_nav_index() != 65535) {
+        // 即使任务已停止，只要还有有效的任务索引就保存断点
+        Location breakpoint_loc = copter.current_loc;
+        if (!breakpoint_loc.change_alt_frame(Location::AltFrame::ABOVE_HOME)) {
+            gcs().send_text(MAV_SEVERITY_WARNING, "Auto: Failed to convert breakpoint altitude frame");
+        }
+        copter.mode_auto.mission.set_breakpoint(breakpoint_loc);
     }
 #if HAL_MOUNT_ENABLED
     copter.camera_mount.set_mode_to_default();
@@ -111,6 +144,11 @@ void ModeAuto::run()
         }
 
         mission.update();
+    }
+
+    // 断点恢复第一阶段（重新起飞）时，确保进入自动油门状态
+    if (mission.return_to_track_phase() == 1 && !copter.ap.auto_armed) {
+        copter.set_auto_armed(true);
     }
 
     // 调用对应的自动控制器
@@ -380,6 +418,7 @@ void ModeAuto::takeoff_start(const Location& dest_loc)
     bool alt_target_terrain = false;
     float current_alt_cm = inertial_nav.get_position_z_up_cm();
     float terrain_offset;   // terrain's altitude in cm above the ekf origin
+    
     if ((dest_loc.get_alt_frame() == Location::AltFrame::ABOVE_TERRAIN) && wp_nav->get_terrain_offset(terrain_offset)) {
         // subtract terrain offset to convert vehicle's alt-above-ekf-origin to alt-above-terrain
         current_alt_cm -= terrain_offset;
@@ -387,6 +426,18 @@ void ModeAuto::takeoff_start(const Location& dest_loc)
         // specify alt_target_cm as alt-above-terrain
         alt_target_cm = dest_loc.alt;
         alt_target_terrain = true;
+    } else if (dest_loc.get_alt_frame() == Location::AltFrame::ABOVE_HOME) {
+        // 对于ABOVE_HOME参考系，直接使用dest_loc.alt作为目标（相对于HOME点）
+        // 获取HOME点高度（相对于EKF原点）
+        const Location &home = AP::ahrs().get_home();
+        int32_t home_alt_cm;
+        if (home.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN, home_alt_cm)) {
+            alt_target_cm = home_alt_cm + dest_loc.alt;
+        } else {
+            // HOME点未设置，使用当前高度+目标相对高度作为fallback
+            gcs().send_text(MAV_SEVERITY_WARNING, "Takeoff: HOME not set, using current alt as reference");
+            alt_target_cm = current_alt_cm + dest_loc.alt;
+        }
     } else {
         // set horizontal target
         Location dest(dest_loc);
@@ -398,7 +449,7 @@ void ModeAuto::takeoff_start(const Location& dest_loc)
             // this failure could only happen if take-off alt was specified as an alt-above terrain and we have no terrain data
             LOGGER_WRITE_ERROR(LogErrorSubsystem::TERRAIN, LogErrorCode::MISSING_TERRAIN_DATA);
             // fall back to altitude above current altitude
-            alt_target_cm = current_alt_cm + dest.alt;
+            alt_target_cm = current_alt_cm + dest_loc.alt;
         }
     }
 
@@ -1560,7 +1611,30 @@ void ModeAuto::do_nav_wp(const AP_Mission::Mission_Command& cmd)
     }
 
     // get waypoint's location from command and send to wp_nav
-    const Location target_loc = loc_from_cmd(cmd, default_loc);
+    Location target_loc = loc_from_cmd(cmd, default_loc);
+
+    // 判断是否需要先回到航线
+    Location proj_loc;
+    gcs().send_text(MAV_SEVERITY_INFO, "Auto: do_nav_wp() called, checking return-to-track...");
+    
+    if (mission.get_return_to_track_wp(proj_loc)) {
+        gcs().send_text(MAV_SEVERITY_INFO, "Auto: Projection point found! Lat=%d, Lon=%d", 
+                       (int)proj_loc.lat, (int)proj_loc.lng);
+        
+        // 只把投影点作为当前导航目标
+        if (!wp_start(proj_loc)) {
+            copter.failsafe_terrain_on_event();
+            return;
+        }
+        
+        gcs().send_text(MAV_SEVERITY_INFO, "Auto: Flying to projection point only");
+        
+        loiter_time = 0;
+        loiter_time_max = 0;  // 投影点不等待
+        return;
+    } else {
+        gcs().send_text(MAV_SEVERITY_INFO, "Auto: No projection point, flying directly to WP");
+    }
 
     if (!wp_start(target_loc)) {
         // failure to set next destination can only be because of missing terrain data
@@ -2105,6 +2179,8 @@ bool ModeAuto::verify_land()
                   leaves mission state machine in the current NAV_LAND
                   mission item. After disarming the mission will reset
                 */
+                // 不在这里保存断点，因为此时已经在地面，高度不正确
+                // 断点应该在退出AUTO模式时（切换到其他模式时）保存
                 copter.arming.disarm(AP_Arming::Method::LANDED);
                 retval = false;
             }

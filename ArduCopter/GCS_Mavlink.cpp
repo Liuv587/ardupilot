@@ -963,9 +963,8 @@ MAV_RESULT GCS_MAVLINK_Copter::handle_MAV_CMD_MISSION_START(const mavlink_comman
         }
         if (copter.set_mode(Mode::Number::AUTO, ModeReason::GCS_COMMAND)) {
             copter.set_auto_armed(true);
-            if (copter.mode_auto.mission.state() != AP_Mission::MISSION_RUNNING) {
-                copter.mode_auto.mission.start_or_resume();
-            }
+            // 不要在这里调用start_or_resume()，让mode_auto的run()函数处理
+            // 这样可以保证waiting_to_start的逻辑不被打断，支持断点恢复功能
             return MAV_RESULT_ACCEPTED;
         }
         return MAV_RESULT_FAILED;

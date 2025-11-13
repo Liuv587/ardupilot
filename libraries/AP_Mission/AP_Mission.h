@@ -568,6 +568,39 @@ public:
         return _nav_cmd.index==AP_MISSION_CMD_INDEX_NONE?0:_nav_cmd.index;
     }
 
+    /// 若正在返航线阶段，返回投影点坐标；true 表示需要先飞往该点
+    bool get_return_to_track_wp(Location& proj_loc);
+
+    /// 获取返航线前保存的原始目标坐标
+    bool get_return_to_track_original(Location& orig_loc) const;
+
+    /// 记录离开 AUTO 时的断点位置
+    void set_breakpoint(const Location& loc);
+
+    /// 清除返航线/断点相关状态
+    void reset_return_state();
+
+    /// 当前 MIS_RESUME_MODE 取值
+    int8_t resume_mode() const { return _resume_mode; }
+
+    /// 是否存在尚未处理的断点
+    bool has_breakpoint() const { return _breakpoint_valid; }
+    
+    /// 清除当前导航指令索引（用于断臂后保留断点但清除任务状态）
+    void clear_nav_cmd_index();
+
+    /// 投影点已到达，进入返航线第二阶段
+    void mark_return_to_track_projection_complete();
+
+    /// 返航线阶段：0=未启用，1=起飞爬升，2=飞向断点，3=飞向原始航点
+    uint8_t return_to_track_phase() const { return _return_track_phase; }
+    
+    /// 是否正在恢复任务
+    bool is_resuming_mission() const { return _flags.resuming_mission; }
+
+    /// 终止返航线流程并清理状态
+    void clear_return_to_track();
+
     /// get_current_nav_id - return the id of the current nav command
     uint16_t get_current_nav_id() const
     {
@@ -874,6 +907,9 @@ private:
     // calculate the location of a resume cmd wp
     bool calc_rewind_pos(Mission_Command& rewind_cmd);
 
+    // calculate the projection point on track line for return to track
+    bool calc_track_projection_point(Mission_Command& projection_cmd);
+
     // update progress made in mission to store last position in the event of mission exit
     void update_exit_position(void);
 
@@ -894,6 +930,7 @@ private:
     AP_Int16                _cmd_total;  // total number of commands in the mission
     AP_Int16                _options;    // bitmask options for missions, currently for mission clearing on reboot but can be expanded as required
     AP_Int8                 _restart;   // controls mission starting point when entering Auto mode (either restart from beginning of mission or resume from last command run)
+    AP_Int8                 _resume_mode;  // controls how vehicle returns to mission after interruption (0=direct, 1=return to track, 2=return to track with rewind)
 
     // internal variables
     bool                    _force_resume;  // when set true it forces mission to resume irrespective of MIS_RESTART param.
@@ -901,6 +938,14 @@ private:
     struct Mission_Command  _nav_cmd;   // current "navigation" command.  It's position in the command list is held in _nav_cmd.index
     struct Mission_Command  _do_cmd;    // current "do" command.  It's position in the command list is held in _do_cmd.index
     struct Mission_Command  _resume_cmd;  // virtual wp command that is used to resume mission if the mission needs to be rewound on resume.
+    struct Mission_Command  _projection_cmd;  // virtual wp command for track projection point when returning to mission path
+    struct Mission_Command  _breakpoint_takeoff_cmd; // 虚拟起飞指令，用于断点恢复
+    Location                _original_target_loc;  // original target location before modifying for return-to-track
+    uint8_t                 _return_track_phase;   // 返航线状态机
+    Location                _breakpoint_loc;       // AUTO 模式退出时的断点
+    bool                    _breakpoint_valid;
+    Mission_Command         _breakpoint_nav_cmd;   // 记录断点时的导航指令
+    bool                    _breakpoint_takeoff_valid;
     uint16_t                _prev_nav_cmd_id;       // id of the previous "navigation" command. (WAYPOINT, LOITER_TO_ALT, ect etc)
     uint16_t                _prev_nav_cmd_index;    // index of the previous "navigation" command.  Rarely used which is why we don't store the whole command
     uint16_t                _prev_nav_cmd_wp_index; // index of the previous "navigation" command that contains a waypoint.  Rarely used which is why we don't store the whole command

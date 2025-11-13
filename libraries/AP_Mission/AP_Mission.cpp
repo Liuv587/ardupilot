@@ -46,6 +46,13 @@ const AP_Param::GroupInfo AP_Mission::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("OPTIONS",  2, AP_Mission, _options, AP_MISSION_OPTIONS_DEFAULT),
 
+    // @Param: RESUME_MODE
+    // @DisplayName: Mission Resume Behavior
+    // @Description: Controls how the vehicle returns to mission after interruption. 0=fly directly to target waypoint, 1=return to track first then continue, 2=return to track with rewind distance
+    // @Values: 0:Direct to Target, 1:return to strict track first then continue, 2:breakpoint resume
+    // @User: Advanced
+    AP_GROUPINFO("RESUME_MODE", 3, AP_Mission, _resume_mode, 0),
+
     AP_GROUPEND
 };
 
@@ -129,23 +136,102 @@ void AP_Mission::stop()
 ///     previous running commands will be re-initialized
 void AP_Mission::resume()
 {
+    // 如果需要断点恢复但当前没有有效的导航索引，尝试还原
+    if (_resume_mode == 2 && _breakpoint_valid &&
+        _breakpoint_nav_cmd.index != AP_MISSION_CMD_INDEX_NONE &&
+        _nav_cmd.index == AP_MISSION_CMD_INDEX_NONE) {
+        _nav_cmd = _breakpoint_nav_cmd;
+    }
+
     // if mission had completed then start it from the first command
+    // 例外：在断点恢复模式下，如果有有效断点，使用断点恢复而不是重新开始
     if (_flags.state == MISSION_COMPLETE) {
-        start();
-        return;
+        if (_resume_mode == 2 && _breakpoint_valid && _breakpoint_nav_cmd.index != AP_MISSION_CMD_INDEX_NONE) {
+            _flags.state = MISSION_STOPPED;  // 改为STOPPED状态以便后续处理
+        } else {
+            start();
+            return;
+        }
     }
 
     // if mission had stopped then restart it
     if (_flags.state == MISSION_STOPPED) {
         _flags.state = MISSION_RUNNING;
 
-        // if no valid nav command index restart from beginning
-        if (_nav_cmd.index == AP_MISSION_CMD_INDEX_NONE) {
+        // if no valid nav command index and no breakpoint, restart from beginning
+        if (_nav_cmd.index == AP_MISSION_CMD_INDEX_NONE && !(_resume_mode == 2 && _breakpoint_valid)) {
             start();
             return;
         }
     }
 
+    // MIS_RESUME_MODE=2：优先检查断点恢复（在读取命令缓存之前）
+    if (_resume_mode == 2 && _breakpoint_valid && !_flags.resuming_mission &&
+        _breakpoint_nav_cmd.index != AP_MISSION_CMD_INDEX_NONE) {
+
+        Mission_Command resume_cmd;
+        if (!read_cmd_from_storage(_breakpoint_nav_cmd.index, resume_cmd)) {
+            _breakpoint_valid = false;
+            goto resume_normal;
+        }
+
+        // 如果断点对应起飞，尽量寻找下一个导航航点
+        if (is_takeoff_type_cmd(resume_cmd.id)) {
+            Mission_Command next_nav_cmd;
+            if (get_next_nav_cmd(resume_cmd.index + 1, next_nav_cmd) && !is_takeoff_type_cmd(next_nav_cmd.id)) {
+                resume_cmd = next_nav_cmd;
+            } else {
+                _breakpoint_valid = false;
+                goto resume_normal;
+            }
+        }
+
+        // 当前起飞位置
+        Location current_loc;
+        if (!AP::ahrs().get_location(current_loc)) {
+            current_loc = _breakpoint_loc;
+        }
+
+        // 记录断点时的原始目标
+        _original_target_loc = resume_cmd.content.location;
+
+        // 生成去往断点的虚拟航点
+        Mission_Command projection_cmd = resume_cmd;
+        projection_cmd.content.location = _breakpoint_loc;
+        // 使用虚拟索引，避免触发航点历史检查
+        projection_cmd.index = AP_MISSION_CMD_INDEX_NONE - 2;
+        _projection_cmd = projection_cmd;
+
+        // 生成起飞指令：使用原始航点的高度作为目标高度
+        // ArduCopter的takeoff_start会自动在当前地点起飞，只使用高度信息
+        Mission_Command takeoff_cmd = resume_cmd;
+        takeoff_cmd.id = MAV_CMD_NAV_TAKEOFF;
+        // 保留resume_cmd的location（包含目标高度），这样可以起飞到正确的高度
+        // takeoff_start会忽略lat/lng，只使用alt
+        // 使用一个虚拟索引，避免触发"已到达中断航点"的检查
+        // 使用AP_MISSION_CMD_INDEX_NONE - 1作为特殊标记
+        takeoff_cmd.index = AP_MISSION_CMD_INDEX_NONE - 1;
+        _breakpoint_takeoff_cmd = takeoff_cmd;
+        _breakpoint_takeoff_valid = true;
+
+        // 将当前导航指令切换为起飞指令，准备阶段：1=起飞
+        _nav_cmd = _breakpoint_takeoff_cmd;
+        _flags.resuming_mission = true;
+        _return_track_phase = 1;
+
+        if (!start_command(_nav_cmd)) {
+            _flags.resuming_mission = false;
+            _return_track_phase = 0;
+            _breakpoint_takeoff_valid = false;
+            return;
+        }
+
+        _flags.nav_cmd_loaded = true;
+        _breakpoint_valid = false;
+        return;
+    }
+
+resume_normal:
     // ensure cache coherence
     if (!read_cmd_from_storage(_nav_cmd.index, _nav_cmd)) {
         // if we failed to read the command from storage, then the command may have
@@ -155,24 +241,34 @@ void AP_Mission::resume()
         return;
     }
 
-    // rewind the mission wp if the repeat distance has been set via MAV_CMD_DO_SET_RESUME_REPEAT_DIST
-    if (_repeat_dist > 0 && _wp_index_history[LAST_WP_PASSED] != AP_MISSION_CMD_INDEX_NONE) {
-        // if not already in a resume state calculate the position to rewind to
-        Mission_Command tmp_cmd;
-        if (!_flags.resuming_mission && calc_rewind_pos(tmp_cmd)) {
-            _resume_cmd = tmp_cmd;
-        }
-
-        // resume mission to rewound position
-        if (_resume_cmd.index != AP_MISSION_CMD_INDEX_NONE && start_command(_resume_cmd)) {
-            _nav_cmd = _resume_cmd;
-            _flags.nav_cmd_loaded = true;
-            // set flag to prevent history being re-written
+    // handle return to track based on MIS_RESUME_MODE parameter
+    if (_resume_mode == 1 && !_flags.resuming_mission) {
+        
+        // Calculate projection point and store it
+        Mission_Command track_point_cmd;
+        if (calc_track_projection_point(track_point_cmd)) {
+            _projection_cmd = track_point_cmd;
+            _original_target_loc = _nav_cmd.content.location;
             _flags.resuming_mission = true;
+            _return_track_phase = 1;
+            
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Return-to-track enabled, restarting nav cmd");
+            
+            if (!start_command(_nav_cmd)) {
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mission: Failed to start nav cmd for return-to-track");
+                _flags.resuming_mission = false;
+                _return_track_phase = 0;
+                return;
+            }
+            _flags.nav_cmd_loaded = true;
+
             return;
+        } else {
+            GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mission: Failed to calculate projection point");
+            _return_track_phase = 0;
         }
     }
-
+    
     // restart active navigation command. We run these on resume()
     // regardless of whether the mission was stopped, as we may be
     // re-entering AUTO mode and the nav_cmd callback needs to be run
@@ -336,7 +432,52 @@ void AP_Mission::update()
     } else {
         // run the active nav command
         if (verify_command(_nav_cmd)) {
-            // market _nav_cmd as complete (it will be started on the next iteration)
+            if (_flags.resuming_mission) {
+                if (_return_track_phase == 1) {
+                    // 起飞阶段完成，开始飞向断点位置
+                    _breakpoint_takeoff_valid = false;
+                    _nav_cmd = _projection_cmd;
+                    _return_track_phase = 2;
+
+                    if (!start_command(_nav_cmd)) {
+                        clear_return_to_track();
+                        _flags.nav_cmd_loaded = false;
+                        return;
+                    }
+
+                    _flags.nav_cmd_loaded = true;
+                    return;
+
+                } else if (_return_track_phase == 2) {
+                    // 到达断点位置，恢复原始目标航点
+                    Mission_Command resume_cmd = _breakpoint_nav_cmd;
+                    if (!read_cmd_from_storage(_breakpoint_nav_cmd.index, resume_cmd)) {
+                        clear_return_to_track();
+                        _flags.nav_cmd_loaded = false;
+                        return;
+                    }
+
+                    _breakpoint_nav_cmd = resume_cmd;
+                    _nav_cmd = _breakpoint_nav_cmd;
+                    _return_track_phase = 3;
+
+                    if (!start_command(_nav_cmd)) {
+                        clear_return_to_track();
+                        _flags.nav_cmd_loaded = false;
+                        return;
+                    }
+
+                    _flags.nav_cmd_loaded = true;
+                    return;
+
+                } else if (_return_track_phase == 3) {
+                    _return_track_phase = 0;
+                    _original_target_loc.zero();
+                    _flags.resuming_mission = false;
+                }
+            }
+            
+            // Normal case: mark _nav_cmd as complete and advance to next command
             _flags.nav_cmd_loaded = false;
             // immediately advance to the next mission command
             if (!advance_current_nav_cmd()) {
@@ -2073,8 +2214,15 @@ bool AP_Mission::advance_current_nav_cmd(uint16_t starting_index)
                 }
             }
             // save a loaded wp index in history array for when _repeat_dist is set via MAV_CMD_DO_SET_RESUME_REPEAT_DIST
+            // or when MIS_RESUME_MODE is enabled for return-to-track functionality
             // and prevent history being re-written until vehicle returns to interrupted position
-            if (_repeat_dist > 0 && !_flags.resuming_mission && _nav_cmd.index != AP_MISSION_CMD_INDEX_NONE && !(_nav_cmd.content.location.lat == 0 && _nav_cmd.content.location.lng == 0)) {
+            // 跳过虚拟索引（用于断点恢复的临时航点）
+            if ((_repeat_dist > 0 || _resume_mode > 0) &&
+                !_flags.resuming_mission &&
+                _nav_cmd.index != AP_MISSION_CMD_INDEX_NONE &&
+                _nav_cmd.index < AP_MISSION_CMD_INDEX_NONE - 10 &&  // 跳过虚拟索引
+                !is_takeoff_type_cmd(_nav_cmd.id) &&
+                !(_nav_cmd.content.location.lat == 0 && _nav_cmd.content.location.lng == 0)) {
                 // update mission history. last index position is always the most recent wp loaded.
                 for (uint8_t i=0; i<AP_MISSION_MAX_WP_HISTORY-1; i++) {
                     _wp_index_history[i] = _wp_index_history[i+1];
@@ -2082,10 +2230,12 @@ bool AP_Mission::advance_current_nav_cmd(uint16_t starting_index)
                 _wp_index_history[AP_MISSION_MAX_WP_HISTORY-1] = _nav_cmd.index;
             }
             // check if the vehicle is resuming and has returned to where it was interrupted
-            if (_flags.resuming_mission && _nav_cmd.index == _wp_index_history[AP_MISSION_MAX_WP_HISTORY-1]) {
-                // vehicle has resumed previous position
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Returned to interrupted WP");
-                _flags.resuming_mission = false;
+            // 不检查虚拟索引
+            if (_flags.resuming_mission && _nav_cmd.index < AP_MISSION_CMD_INDEX_NONE - 10) {
+                // normal rewind case: check if we're at the interrupted waypoint
+                if (_nav_cmd.index == _wp_index_history[AP_MISSION_MAX_WP_HISTORY-1]) {
+                    _flags.resuming_mission = false;
+                }
             }
 
         } else {
@@ -2978,6 +3128,8 @@ void AP_Mission::reset_wp_history(void)
     _resume_cmd.index = AP_MISSION_CMD_INDEX_NONE;
     _flags.resuming_mission = false;
     _repeat_dist = 0;
+    _original_target_loc.zero();
+    _return_track_phase = 0;
 }
 
 // store the latest reported position incase of mission exit and rewind resume
@@ -3074,6 +3226,216 @@ bool AP_Mission::calc_rewind_pos(Mission_Command& rewind_cmd)
     // continues as planned without further intervention.  The resume wp is not written to memory so will not perminantely change the mission.
 
     // if we got this far then mission rewind position was successfully calculated
+    return true;
+}
+
+/// get_return_to_track_wp - returns projection point if return-to-track is active
+bool AP_Mission::get_return_to_track_wp(Location& proj_loc)
+{
+    if (_flags.resuming_mission && _return_track_phase == 2) {
+        proj_loc = _projection_cmd.content.location;
+        return true;
+    }
+    return false;
+}
+
+bool AP_Mission::get_return_to_track_original(Location& orig_loc) const
+{
+    if (_flags.resuming_mission && (_original_target_loc.lat != 0 || _original_target_loc.lng != 0)) {
+        orig_loc = _original_target_loc;
+        return true;
+    }
+    return false;
+}
+
+void AP_Mission::set_breakpoint(const Location& loc)
+{
+    if (_resume_mode != 2) {
+        _breakpoint_valid = false;
+        _breakpoint_nav_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+        return;
+    }
+
+
+
+
+    Mission_Command resume_cmd = {};
+    bool have_resume_cmd = false;
+
+    // 如果当前指令是降落指令，使用航点历史中的最后一个有效航点
+    if (_nav_cmd.index != AP_MISSION_CMD_INDEX_NONE && is_landing_type_cmd(_nav_cmd.id)) {
+        // 从历史记录中获取降落前的最后一个有效航点
+        if (_wp_index_history[LAST_WP_PASSED] != AP_MISSION_CMD_INDEX_NONE) {
+            if (read_cmd_from_storage(_wp_index_history[LAST_WP_PASSED], resume_cmd)) {
+                have_resume_cmd = true;
+            }
+        }
+    }
+    // 首选当前导航指令（如果有效且不是起飞或降落）
+    else if (_nav_cmd.index != AP_MISSION_CMD_INDEX_NONE && !is_takeoff_type_cmd(_nav_cmd.id)) {
+        resume_cmd = _nav_cmd;
+        have_resume_cmd = true;
+    }
+
+    // 如果当前指令无效或属于起飞，尝试寻找下一个有效的导航航点
+    if (!have_resume_cmd) {
+        Mission_Command next_nav_cmd;
+        uint16_t search_index = _nav_cmd.index;
+
+        if (search_index == AP_MISSION_CMD_INDEX_NONE) {
+            if (_wp_index_history[LAST_WP_PASSED] != AP_MISSION_CMD_INDEX_NONE) {
+                search_index = _wp_index_history[LAST_WP_PASSED] + 1;
+            } else {
+                search_index = AP_MISSION_FIRST_REAL_COMMAND;
+            }
+        } else {
+            search_index = search_index + 1;
+        }
+
+        if (get_next_nav_cmd(search_index, next_nav_cmd) && !is_takeoff_type_cmd(next_nav_cmd.id)) {
+            resume_cmd = next_nav_cmd;
+            have_resume_cmd = true;
+        }
+    }
+
+    if (!have_resume_cmd) {
+        _breakpoint_valid = false;
+        _breakpoint_nav_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+        return;
+    }
+
+    reset_return_state();
+
+    _breakpoint_loc = loc;
+    _breakpoint_valid = true;
+    _breakpoint_nav_cmd = resume_cmd;
+}
+
+void AP_Mission::mark_return_to_track_projection_complete()
+{
+    if (_flags.resuming_mission && _return_track_phase == 2) {
+        _return_track_phase = 3;
+    }
+}
+
+/// clear_return_to_track - clear the return-to-track state after reaching projection point
+void AP_Mission::clear_return_to_track()
+{
+    _return_track_phase = 0;
+    _breakpoint_takeoff_valid = false;
+    if (_flags.resuming_mission) {
+        _original_target_loc.zero();
+        _flags.resuming_mission = false;
+    }
+}
+
+void AP_Mission::reset_return_state()
+{
+    _flags.resuming_mission = false;
+    _return_track_phase = 0;
+    _original_target_loc.zero();
+    _projection_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+    _breakpoint_takeoff_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+    _breakpoint_takeoff_valid = false;
+    // 注意：不清除 _breakpoint_nav_cmd，因为断点应该持久保存直到新断点被设置
+    // _breakpoint_nav_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+}
+
+void AP_Mission::clear_nav_cmd_index()
+{
+    _nav_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+    _flags.nav_cmd_loaded = false;
+    _flags.resuming_mission = false;
+    _return_track_phase = 0;
+    // 注意：不清除_breakpoint_valid，保持断点有效性
+}
+
+/// calc_track_projection_point - calculate the closest point on the track line
+/// to return to the mission path after interruption
+bool AP_Mission::calc_track_projection_point(Mission_Command& projection_cmd)
+{
+    _projection_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+    // get current location
+    Location current_loc;
+    if (!AP::ahrs().get_location(current_loc)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mission: Can't get current location");
+        return false;
+    }
+    
+    // 必须有最近通过的航点才可以计算航线
+    if (_wp_index_history[LAST_WP_PASSED] == AP_MISSION_CMD_INDEX_NONE) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: No WP history, flying directly to target");
+        return false;
+    }
+    
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Last WP=%u, Current target WP=%u", 
+                  _wp_index_history[LAST_WP_PASSED], _nav_cmd.index);
+    
+    // 航线起点：最近通过的航点
+    Mission_Command prev_cmd;
+    if (!read_cmd_from_storage(_wp_index_history[LAST_WP_PASSED], prev_cmd)) {
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mission: Failed to read last WP from storage");
+        return false;
+    }
+    Location wp_start = prev_cmd.content.location;
+    
+    // 航线终点：当前导航目标航点
+    Location wp_end = _nav_cmd.content.location;
+    
+    // 航线向量（NED）
+    Vector3f track_vec_ned = wp_start.get_distance_NED(wp_end);
+    float track_length = track_vec_ned.length();
+    
+    // 航线长度过短则无需返航线
+    if (track_length < 1.0f) {
+        return false;
+    }
+    
+    // 当前相对起点的位移向量
+    Vector3f pos_vec_ned = wp_start.get_distance_NED(current_loc);
+    
+    // 点乘求投影长度
+    float projection_length = (pos_vec_ned.x * track_vec_ned.x + 
+                               pos_vec_ned.y * track_vec_ned.y + 
+                               pos_vec_ned.z * track_vec_ned.z) / track_length;
+    
+    // 限制在航线段范围内
+    projection_length = constrain_float(projection_length, 0.0f, track_length);
+    
+    // 航线单位向量
+    Vector3f track_unit = track_vec_ned / track_length;
+    
+    // 投影点相对起点的偏移
+    Vector3f projection_vec = track_unit * projection_length;
+    
+    // 计算横向误差用于判断是否需要返航线
+    Vector3f cross_track_vec = pos_vec_ned - projection_vec;
+    float cross_track_error = cross_track_vec.length();
+    
+    if (cross_track_error < 2.0f) {
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Already on track (error %.1fm), continuing directly",
+                      (double)cross_track_error);
+        _return_track_phase = 0;
+        return false;
+    }
+    
+    // 生成临时投影点航点
+    projection_cmd = _nav_cmd;  // copy attributes from current target waypoint
+    projection_cmd.content.location = wp_start;
+    projection_cmd.content.location.offset(projection_vec.x, projection_vec.y);
+    projection_cmd.content.location.alt += projection_vec.z * 100;  // NED is in meters, alt is in cm
+    
+    // 强制设为普通航点
+    projection_cmd.id = MAV_CMD_NAV_WAYPOINT;
+    projection_cmd.p1 = 0;  // no delay at waypoint
+    
+    // 延用原航点索引，外部逻辑会识别这是返航线流程
+    projection_cmd.index = _nav_cmd.index;
+    
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Return to track, cross-track error %.1fm", 
+                  (double)cross_track_error);
+    
+    _return_track_phase = 1;
     return true;
 }
 

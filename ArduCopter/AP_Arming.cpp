@@ -816,8 +816,17 @@ bool AP_Arming_Copter::disarm(const AP_Arming::Method method, bool do_disarm_che
     copter.motors->armed(false);
 
 #if MODE_AUTO_ENABLED
-    // reset the mission
-    copter.mode_auto.mission.reset();
+    // 在断点恢复模式下，如果断点已保存，部分重置任务
+    // 清除当前指令索引，但保留断点信息
+    if (copter.mode_auto.mission.resume_mode() == 2 && copter.mode_auto.mission.has_breakpoint()) {
+        // 清除当前导航指令索引，这样resume()会触发断点恢复逻辑
+        copter.mode_auto.mission.clear_nav_cmd_index();
+        // 确保任务状态是STOPPED，这样resume()会被正确触发
+        copter.mode_auto.mission.stop();
+    } else {
+        // 正常情况下完全重置任务
+        copter.mode_auto.mission.reset();
+    }
 #endif
 
 #if HAL_LOGGING_ENABLED
