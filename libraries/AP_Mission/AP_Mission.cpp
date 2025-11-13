@@ -53,6 +53,38 @@ const AP_Param::GroupInfo AP_Mission::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("RESUME_MODE", 3, AP_Mission, _resume_mode, 0),
 
+    // @Param: BP_LAT
+    // @DisplayName: Breakpoint Latitude
+    // @Description: Saved breakpoint latitude (degrees * 1e7). Set to 0 to clear.
+    // @User: Advanced
+    AP_GROUPINFO("BP_LAT", 4, AP_Mission, _breakpoint_lat, 0),
+
+    // @Param: BP_LNG
+    // @DisplayName: Breakpoint Longitude
+    // @Description: Saved breakpoint longitude (degrees * 1e7). Set to 0 to clear.
+    // @User: Advanced
+    AP_GROUPINFO("BP_LNG", 5, AP_Mission, _breakpoint_lng, 0),
+
+    // @Param: BP_ALT
+    // @DisplayName: Breakpoint Altitude
+    // @Description: Saved breakpoint altitude in cm
+    // @Units: cm
+    // @User: Advanced
+    AP_GROUPINFO("BP_ALT", 6, AP_Mission, _breakpoint_alt, 0),
+
+    // @Param: BP_WP_IDX
+    // @DisplayName: Breakpoint Waypoint Index
+    // @Description: Saved breakpoint waypoint index. -1 means no breakpoint.
+    // @User: Advanced
+    AP_GROUPINFO("BP_WP_IDX", 7, AP_Mission, _breakpoint_wp_idx, -1),
+
+    // @Param: BP_VALID
+    // @DisplayName: Breakpoint Valid
+    // @Description: 1 if breakpoint is valid and should be used on next AUTO mode entry
+    // @Values: 0:Invalid, 1:Valid
+    // @User: Advanced
+    AP_GROUPINFO("BP_VALID", 8, AP_Mission, _breakpoint_valid_param, 0),
+
     AP_GROUPEND
 };
 
@@ -106,6 +138,49 @@ void AP_Mission::init()
     if (option_is_set(Option::CLEAR_ON_BOOT)) {
         GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Clearing Mission");
         clear();
+    }
+
+    // 从参数加载断点信息（断电后恢复）
+    const int8_t bp_flags = _breakpoint_valid_param.get();
+    if ((bp_flags & 0x01) && _breakpoint_wp_idx >= 0) {
+        _breakpoint_loc.lat = _breakpoint_lat;
+        _breakpoint_loc.lng = _breakpoint_lng;
+
+        Location::AltFrame stored_frame = Location::AltFrame::ABOVE_HOME;
+        switch ((bp_flags >> 1) & 0x03) {
+        case 0:
+            stored_frame = Location::AltFrame::ABSOLUTE;
+            break;
+        case 1:
+            stored_frame = Location::AltFrame::ABOVE_HOME;
+            break;
+        case 2:
+            stored_frame = Location::AltFrame::ABOVE_ORIGIN;
+            break;
+        case 3:
+            stored_frame = Location::AltFrame::ABOVE_TERRAIN;
+            break;
+        }
+
+        _breakpoint_loc.set_alt_cm(_breakpoint_alt, stored_frame);
+
+        if (stored_frame != Location::AltFrame::ABOVE_HOME) {
+            int32_t alt_home_cm;
+            if (_breakpoint_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, alt_home_cm)) {
+                _breakpoint_loc.set_alt_cm(alt_home_cm, Location::AltFrame::ABOVE_HOME);
+                _breakpoint_alt.set_and_save(_breakpoint_loc.alt);
+                const int8_t home_frame_bits = static_cast<int8_t>(_breakpoint_loc.get_alt_frame()) & 0x03;
+                _breakpoint_valid_param.set_and_save(static_cast<int8_t>(1 | (home_frame_bits << 1)));
+                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint alt frame converted to HOME");
+            }
+        }
+
+        _breakpoint_nav_cmd.index = _breakpoint_wp_idx;
+        _breakpoint_valid = true;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint loaded from EEPROM (WP %d)", 
+                      (int)_breakpoint_wp_idx.get());
+    } else {
+        _breakpoint_valid = false;
     }
 
     _last_change_time_ms = AP_HAL::millis();
@@ -202,17 +277,35 @@ void AP_Mission::resume()
         projection_cmd.index = AP_MISSION_CMD_INDEX_NONE - 2;
         _projection_cmd = projection_cmd;
 
-        // 生成起飞指令：使用原始航点的高度作为目标高度
-        // ArduCopter的takeoff_start会自动在当前地点起飞，只使用高度信息
+        // 生成起飞指令：起飞到断点的高度（确保能到达断点）
         Mission_Command takeoff_cmd = resume_cmd;
         takeoff_cmd.id = MAV_CMD_NAV_TAKEOFF;
-        // 保留resume_cmd的location（包含目标高度），这样可以起飞到正确的高度
-        // takeoff_start会忽略lat/lng，只使用alt
-        // 使用一个虚拟索引，避免触发"已到达中断航点"的检查
-        // 使用AP_MISSION_CMD_INDEX_NONE - 1作为特殊标记
-        takeoff_cmd.index = AP_MISSION_CMD_INDEX_NONE - 1;
+        takeoff_cmd.content.location = _breakpoint_loc;  // 使用断点位置（包含正确的参考系）
+        
+        // 起飞高度：使用断点高度（相对于HOME），但至少10米（1000cm）
+        int32_t takeoff_alt = _breakpoint_loc.alt;
+        bool takeoff_alt_ok = _breakpoint_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, takeoff_alt);
+        if (!takeoff_alt_ok) {
+            takeoff_alt = _breakpoint_loc.alt;
+        }
+        if (takeoff_alt < 100) {
+            takeoff_alt = 100;  // 至少上升1米，避免目标为零
+        }
+        takeoff_cmd.content.location.set_alt_cm(takeoff_alt, Location::AltFrame::ABOVE_HOME);
+        takeoff_cmd.index = AP_MISSION_CMD_INDEX_NONE - 1;  // 虚拟索引
         _breakpoint_takeoff_cmd = takeoff_cmd;
         _breakpoint_takeoff_valid = true;
+        
+        int32_t breakpoint_alt_home = _breakpoint_loc.alt;
+        if (!_breakpoint_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, breakpoint_alt_home)) {
+            breakpoint_alt_home = _breakpoint_loc.alt;
+        }
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                      "Mission: Breakpoint takeoff to alt %d cm (frame=%d, home_alt=%d cm, takeoff_alt_ok=%d)",
+                      (int)takeoff_alt,
+                      (int)takeoff_cmd.content.location.get_alt_frame(),
+                      (int)breakpoint_alt_home,
+                      (int)takeoff_alt_ok);
 
         // 将当前导航指令切换为起飞指令，准备阶段：1=起飞
         _nav_cmd = _breakpoint_takeoff_cmd;
@@ -430,16 +523,41 @@ void AP_Mission::update()
             return;
         }
     } else {
+        // 断点恢复阶段1：检查起飞是否真正完成
+        if (_flags.resuming_mission && _return_track_phase == 1 && _breakpoint_takeoff_valid) {
+            // 检查起飞高度
+            Location current_loc;
+            if (AP::ahrs().get_location(current_loc)) {
+                int32_t target_alt = _breakpoint_takeoff_cmd.content.location.alt;
+                int32_t current_alt = current_loc.alt;
+                
+                // 如果还没到目标高度的90%，继续等待
+                if (current_alt < target_alt * 0.9) {
+                    static uint32_t last_alt_msg = 0;
+                    uint32_t now = AP_HAL::millis();
+                    if (now - last_alt_msg > 2000) {
+                        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Waiting for takeoff, alt=%d/%d cm", 
+                                     (int)current_alt, (int)target_alt);
+                        last_alt_msg = now;
+                    }
+                    // 不推进，继续等待起飞
+                    return;
+                }
+            }
+        }
+        
         // run the active nav command
         if (verify_command(_nav_cmd)) {
             if (_flags.resuming_mission) {
                 if (_return_track_phase == 1) {
                     // 起飞阶段完成，开始飞向断点位置
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint Stage 1 DONE (takeoff verified), start Stage 2 (to breakpoint)");
                     _breakpoint_takeoff_valid = false;
                     _nav_cmd = _projection_cmd;
                     _return_track_phase = 2;
 
                     if (!start_command(_nav_cmd)) {
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mission: Failed to start stage 2");
                         clear_return_to_track();
                         _flags.nav_cmd_loaded = false;
                         return;
@@ -450,8 +568,11 @@ void AP_Mission::update()
 
                 } else if (_return_track_phase == 2) {
                     // 到达断点位置，恢复原始目标航点
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint Stage 2 DONE (at breakpoint), start Stage 3 (to original WP%d)", 
+                                  (int)_breakpoint_nav_cmd.index);
                     Mission_Command resume_cmd = _breakpoint_nav_cmd;
                     if (!read_cmd_from_storage(_breakpoint_nav_cmd.index, resume_cmd)) {
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mission: Failed to read original WP");
                         clear_return_to_track();
                         _flags.nav_cmd_loaded = false;
                         return;
@@ -462,6 +583,7 @@ void AP_Mission::update()
                     _return_track_phase = 3;
 
                     if (!start_command(_nav_cmd)) {
+                        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mission: Failed to start stage 3");
                         clear_return_to_track();
                         _flags.nav_cmd_loaded = false;
                         return;
@@ -471,9 +593,13 @@ void AP_Mission::update()
                     return;
 
                 } else if (_return_track_phase == 3) {
+                    // 阶段3：已经到达原始航点，清除断点状态，继续正常任务流程
+                    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint Stage 3 DONE (at original WP), resume complete, advancing to next WP");
+                    clear_breakpoint();
                     _return_track_phase = 0;
                     _original_target_loc.zero();
                     _flags.resuming_mission = false;
+                    // 继续执行下面的advance_current_nav_cmd()，推进到下一个航点
                 }
             }
             
@@ -3251,12 +3377,9 @@ bool AP_Mission::get_return_to_track_original(Location& orig_loc) const
 void AP_Mission::set_breakpoint(const Location& loc)
 {
     if (_resume_mode != 2) {
-        _breakpoint_valid = false;
-        _breakpoint_nav_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+        clear_breakpoint();
         return;
     }
-
-
 
 
     Mission_Command resume_cmd = {};
@@ -3299,16 +3422,68 @@ void AP_Mission::set_breakpoint(const Location& loc)
     }
 
     if (!have_resume_cmd) {
-        _breakpoint_valid = false;
-        _breakpoint_nav_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: No usable nav cmd for breakpoint, clearing");
+        clear_breakpoint();
         return;
     }
 
     reset_return_state();
 
-    _breakpoint_loc = loc;
+    Location bp_loc = loc;
+    int32_t alt_above_home_cm;
+    if (loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, alt_above_home_cm)) {
+        bp_loc.set_alt_cm(alt_above_home_cm, Location::AltFrame::ABOVE_HOME);
+    } else {
+        // 如果无法转换到HOME坐标系，退化为相对于EKF原点
+        int32_t alt_above_origin_cm;
+        if (loc.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN, alt_above_origin_cm)) {
+            bp_loc.set_alt_cm(alt_above_origin_cm, Location::AltFrame::ABOVE_ORIGIN);
+        }
+        GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mission: Breakpoint alt frame fallback (HOME not available)");
+    }
+
+    int32_t dbg_alt_home = 0;
+    int32_t dbg_alt_origin = 0;
+    bool dbg_home_ok = bp_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, dbg_alt_home);
+    bool dbg_origin_ok = bp_loc.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN, dbg_alt_origin);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
+                  "Mission: BP set raw_alt=%d frame=%d alt_home=%d(ok=%d) alt_origin=%d(ok=%d)",
+                  (int)bp_loc.alt,
+                  (int)bp_loc.get_alt_frame(),
+                  (int)dbg_alt_home,
+                  (int)dbg_home_ok,
+                  (int)dbg_alt_origin,
+                  (int)dbg_origin_ok);
+
+    _breakpoint_loc = bp_loc;
     _breakpoint_valid = true;
     _breakpoint_nav_cmd = resume_cmd;
+
+    // 保存断点信息到参数（持久化，断电不丢失）
+    _breakpoint_lat.set_and_save(_breakpoint_loc.lat);
+    _breakpoint_lng.set_and_save(_breakpoint_loc.lng);
+    _breakpoint_alt.set_and_save(_breakpoint_loc.alt);
+    _breakpoint_wp_idx.set_and_save(resume_cmd.index);
+    const int8_t frame_bits = static_cast<int8_t>(_breakpoint_loc.get_alt_frame()) & 0x03;
+    _breakpoint_valid_param.set_and_save(static_cast<int8_t>(1 | (frame_bits << 1)));
+
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint saved to EEPROM (WP %d)", (int)resume_cmd.index);
+}
+
+void AP_Mission::clear_breakpoint()
+{
+    _breakpoint_valid = false;
+    _breakpoint_nav_cmd.index = AP_MISSION_CMD_INDEX_NONE;
+    _breakpoint_loc.zero();
+    
+    // 清除参数（持久化）
+    _breakpoint_lat.set_and_save(0);
+    _breakpoint_lng.set_and_save(0);
+    _breakpoint_alt.set_and_save(0);
+    _breakpoint_wp_idx.set_and_save(-1);
+    _breakpoint_valid_param.set_and_save(0);
+    
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint cleared from EEPROM");
 }
 
 void AP_Mission::mark_return_to_track_projection_complete()

@@ -83,28 +83,44 @@ bool ModeAuto::init(bool ignore_checks)
 void ModeAuto::exit()
 {
     if (copter.mode_auto.mission.state() == AP_Mission::MISSION_RUNNING) {
+        // 只在飞行中（未降落）记录断点，避免断点高度为0
         if (copter.mode_auto.mission.resume_mode() == 2 &&
-            copter.current_loc.initialised()) {
+            copter.current_loc.initialised() &&
+            !copter.ap.land_complete) {  // 关键：只在空中记录！
+
+            int32_t raw_alt_cm = copter.current_loc.alt;
+            int32_t alt_home_cm = raw_alt_cm;
+            int32_t alt_origin_cm = raw_alt_cm;
+            bool alt_home_ok = copter.current_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, alt_home_cm);
+            bool alt_origin_ok = copter.current_loc.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN, alt_origin_cm);
+
+            gcs().send_text(MAV_SEVERITY_INFO,
+                            "Auto: exit BP raw_alt=%d frame=%d alt_home=%d(ok=%d) alt_origin=%d(ok=%d)",
+                            (int)raw_alt_cm,
+                            (int)copter.current_loc.get_alt_frame(),
+                            (int)alt_home_cm,
+                            (int)alt_home_ok,
+                            (int)alt_origin_cm,
+                            (int)alt_origin_ok);
+
             // 创建一个使用ABOVE_HOME参考系的位置
             Location breakpoint_loc = copter.current_loc;
             // 确保使用相对高度（ABOVE_HOME）
             if (!breakpoint_loc.change_alt_frame(Location::AltFrame::ABOVE_HOME)) {
                 gcs().send_text(MAV_SEVERITY_WARNING, "Auto: Failed to convert breakpoint altitude frame");
             }
-            copter.mode_auto.mission.set_breakpoint(breakpoint_loc);
+
+            // 检查高度是否合理（至少5米）
+            if (breakpoint_loc.alt >= 120) {  // 至少1.2米高
+                copter.mode_auto.mission.set_breakpoint(breakpoint_loc);
+            } else {
+                gcs().send_text(MAV_SEVERITY_INFO, "Auto: Breakpoint altitude too low (%d cm), not saved",
+                               (int)breakpoint_loc.alt);
+            }
         }
 
         copter.mode_auto.mission.reset_return_state();
         copter.mode_auto.mission.stop();
-    } else if (copter.mode_auto.mission.resume_mode() == 2 && 
-               copter.current_loc.initialised() &&
-               copter.mode_auto.mission.get_current_nav_index() != 65535) {
-        // 即使任务已停止，只要还有有效的任务索引就保存断点
-        Location breakpoint_loc = copter.current_loc;
-        if (!breakpoint_loc.change_alt_frame(Location::AltFrame::ABOVE_HOME)) {
-            gcs().send_text(MAV_SEVERITY_WARNING, "Auto: Failed to convert breakpoint altitude frame");
-        }
-        copter.mode_auto.mission.set_breakpoint(breakpoint_loc);
     }
 #if HAL_MOUNT_ENABLED
     copter.camera_mount.set_mode_to_default();
@@ -412,13 +428,22 @@ void ModeAuto::takeoff_start(const Location& dest_loc)
         return;
     }
 
+    // 添加调试信息
+    gcs().send_text(MAV_SEVERITY_INFO, "takeoff_start: dest_alt=%d cm, frame=%d", 
+                   (int)dest_loc.alt, (int)dest_loc.get_alt_frame());
+
     // calculate current and target altitudes
     // by default current_alt_cm and alt_target_cm are alt-above-EKF-origin
     int32_t alt_target_cm;
     bool alt_target_terrain = false;
     float current_alt_cm = inertial_nav.get_position_z_up_cm();
     float terrain_offset;   // terrain's altitude in cm above the ekf origin
-    
+    bool alt_conversion_success = true;
+    bool used_fallback = false;
+    const uint8_t dest_rel_flag = dest_loc.relative_alt;
+    const uint8_t dest_origin_flag = dest_loc.origin_alt;
+    const uint8_t dest_terrain_flag = dest_loc.terrain_alt;
+
     if ((dest_loc.get_alt_frame() == Location::AltFrame::ABOVE_TERRAIN) && wp_nav->get_terrain_offset(terrain_offset)) {
         // subtract terrain offset to convert vehicle's alt-above-ekf-origin to alt-above-terrain
         current_alt_cm -= terrain_offset;
@@ -437,6 +462,8 @@ void ModeAuto::takeoff_start(const Location& dest_loc)
             // HOME点未设置，使用当前高度+目标相对高度作为fallback
             gcs().send_text(MAV_SEVERITY_WARNING, "Takeoff: HOME not set, using current alt as reference");
             alt_target_cm = current_alt_cm + dest_loc.alt;
+            alt_conversion_success = false;
+            used_fallback = true;
         }
     } else {
         // set horizontal target
@@ -450,12 +477,28 @@ void ModeAuto::takeoff_start(const Location& dest_loc)
             LOGGER_WRITE_ERROR(LogErrorSubsystem::TERRAIN, LogErrorCode::MISSING_TERRAIN_DATA);
             // fall back to altitude above current altitude
             alt_target_cm = current_alt_cm + dest_loc.alt;
+            alt_conversion_success = false;
+            used_fallback = true;
         }
     }
 
     // sanity check target
     int32_t alt_target_min_cm = current_alt_cm + (copter.ap.land_complete ? 100 : 0);
+    int32_t alt_target_pre_clamp = alt_target_cm;
     alt_target_cm = MAX(alt_target_cm, alt_target_min_cm);
+
+    // 调试信息：显示最终的起飞目标高度
+    gcs().send_text(MAV_SEVERITY_INFO,
+                    "takeoff_start: final=%d cm (pre=%d, min=%d) current=%d cm flags r/o/t=%d/%d/%d conv_ok=%d fallback=%d",
+                    (int)alt_target_cm,
+                    (int)alt_target_pre_clamp,
+                    (int)alt_target_min_cm,
+                    (int)current_alt_cm,
+                    (int)dest_rel_flag,
+                    (int)dest_origin_flag,
+                    (int)dest_terrain_flag,
+                    (int)alt_conversion_success,
+                    (int)used_fallback);
 
     // initialise yaw
     auto_yaw.set_mode(AutoYaw::Mode::HOLD);
@@ -1565,6 +1608,12 @@ void ModeAuto::subtract_pos_offsets(Location& target_loc) const
 // do_takeoff - initiate takeoff navigation command
 void ModeAuto::do_takeoff(const AP_Mission::Mission_Command& cmd)
 {
+    // 添加调试信息
+    if (mission.return_to_track_phase() == 1) {
+        gcs().send_text(MAV_SEVERITY_INFO, "Auto: do_takeoff() for breakpoint, target alt=%d cm, current alt=%d cm", 
+                       (int)cmd.content.location.alt, (int)copter.current_loc.alt);
+    }
+    
     // Set wp navigation target to safe altitude above current position
     takeoff_start(cmd.content.location);
 }
@@ -2148,6 +2197,18 @@ bool ModeAuto::verify_takeoff()
         copter.landinggear.retract_after_takeoff();
     }
 #endif
+
+    // 添加调试信息
+    if (!auto_takeoff.complete && mission.return_to_track_phase() == 1) {
+        // 断点恢复起飞阶段，打印进度
+        static uint32_t last_debug_ms = 0;
+        uint32_t now = AP_HAL::millis();
+        if (now - last_debug_ms > 1000) {  // 每秒打印一次
+            gcs().send_text(MAV_SEVERITY_INFO, "Auto: Breakpoint takeoff in progress, alt=%d cm", 
+                           (int)copter.current_loc.alt);
+            last_debug_ms = now;
+        }
+    }
 
     return auto_takeoff.complete;
 }

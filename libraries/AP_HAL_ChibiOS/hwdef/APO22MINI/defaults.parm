@@ -4,3 +4,25 @@ NTF_LED_TYPES 257
 
 #enable CAN port
 CAN_P1_DRIVER 1
+
+# Disable baro and compass checks due to hardware limitations
+# ARMING_CHECK bitmask: 
+#   - Exclude baro (bit 5, value 32)
+#   - Exclude compass (bit 2, value 4)
+# All checks except baro and compass: 511 - 32 - 4 = 475
+ARMING_CHECK 475  # All checks except baro and compass
+
+# Disable compass usage (no built-in compass on this board)
+COMPASS_ENABLE 0
+
+# Allow calibration with unhealthy baro
+BARO_OPTIONS 1
+
+# EKF settings for GPS-only altitude (no baro)
+EK3_SRC1_POSZ 3   # Use GPS for altitude instead of baro
+EK3_SRC2_POSZ 3   # Use GPS for altitude instead of baro  
+EK3_SRC3_POSZ 3   # Use GPS for altitude instead of baro
+
+# Disable baro usage in AHRS
+AHRS_EKF_TYPE 3   # Use EKF3
+

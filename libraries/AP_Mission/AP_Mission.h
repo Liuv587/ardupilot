@@ -577,6 +577,9 @@ public:
     /// 记录离开 AUTO 时的断点位置
     void set_breakpoint(const Location& loc);
 
+    /// 清除断点信息（包括参数）
+    void clear_breakpoint();
+
     /// 清除返航线/断点相关状态
     void reset_return_state();
 
@@ -931,6 +934,11 @@ private:
     AP_Int16                _options;    // bitmask options for missions, currently for mission clearing on reboot but can be expanded as required
     AP_Int8                 _restart;   // controls mission starting point when entering Auto mode (either restart from beginning of mission or resume from last command run)
     AP_Int8                 _resume_mode;  // controls how vehicle returns to mission after interruption (0=direct, 1=return to track, 2=return to track with rewind)
+    AP_Int32                _breakpoint_lat;    // 断点纬度（* 1e7）
+    AP_Int32                _breakpoint_lng;    // 断点经度（* 1e7）
+    AP_Int32                _breakpoint_alt;    // 断点高度（cm）
+    AP_Int16                _breakpoint_wp_idx; // 断点对应的航点索引
+    AP_Int8                 _breakpoint_valid_param; // 断点是否有效（0/1）
 
     // internal variables
     bool                    _force_resume;  // when set true it forces mission to resume irrespective of MIS_RESTART param.
