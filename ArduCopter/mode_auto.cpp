@@ -162,8 +162,10 @@ void ModeAuto::run()
         mission.update();
     }
 
-    // 断点恢复第一阶段（重新起飞）时，确保进入自动油门状态
-    if (mission.return_to_track_phase() == 1 && !copter.ap.auto_armed) {
+    // 断点恢复第一阶段（重新起飞）时，持续强制维持自动油门状态
+    // 移除 !copter.ap.auto_armed 条件，防止竞态条件导致 auto_armed 被意外清除后无法恢复
+    // 这样即使 update_auto_armed() 因油门在零位而不设置，这里也能保证状态正确
+    if (mission.return_to_track_phase() == 1) {
         copter.set_auto_armed(true);
     }
 
@@ -1130,6 +1132,11 @@ bool ModeAuto::verify_command(const AP_Mission::Mission_Command& cmd)
 //      called by auto_run at 100hz or more
 void ModeAuto::takeoff_run()
 {
+    // 断点续飞起飞阶段，强制设置 auto_armed（防止油门在零位导致的竞态问题）
+    if (mission.return_to_track_phase() == 1) {
+        copter.set_auto_armed(true);
+    }
+    
     // if the user doesn't want to raise the throttle we can set it automatically
     // note that this can defeat the disarm check on takeoff
     if (option_is_enabled(Option::AllowTakeOffWithoutRaisingThrottle)) {

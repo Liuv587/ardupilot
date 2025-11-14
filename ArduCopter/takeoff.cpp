@@ -123,6 +123,21 @@ void _AutoTakeoff::run()
 
     // if not armed set throttle to zero and exit immediately
     if (!motors->armed() || !copter.ap.auto_armed) {
+        // 添加调试日志，帮助诊断断点续飞悬停不动问题
+        static uint32_t last_warning_ms = 0;
+        uint32_t now_ms = AP_HAL::millis();
+        if (now_ms - last_warning_ms > 2000) {  // 每2秒打印一次
+            if (!motors->armed()) {
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Auto takeoff blocked: motors not armed");
+            } else if (!copter.ap.auto_armed) {
+                GCS_SEND_TEXT(MAV_SEVERITY_WARNING, 
+                    "Auto takeoff blocked: auto_armed=false, throttle_zero=%d, phase=%d", 
+                    copter.ap.throttle_zero, 
+                    copter.mission.return_to_track_phase());
+            }
+            last_warning_ms = now_ms;
+        }
+        
         // do not spool down tradheli when on the ground with motor interlock enabled
         copter.flightmode->make_safe_ground_handling(copter.is_tradheli() && motors->get_interlock());
         // update auto_takeoff_no_nav_alt_cm
@@ -143,6 +158,17 @@ void _AutoTakeoff::run()
 
     // aircraft stays in landed state until rotor speed run up has finished
     if (motors->get_spool_state() != AP_Motors::SpoolState::THROTTLE_UNLIMITED) {
+        // 调试日志：电机未完成 spool up
+        static uint32_t last_spool_log_ms = 0;
+        uint32_t now_ms = AP_HAL::millis();
+        if (now_ms - last_spool_log_ms > 2000) {
+            GCS_SEND_TEXT(MAV_SEVERITY_INFO, 
+                "Auto takeoff: waiting for motor spool up, state=%d, phase=%d", 
+                (int)motors->get_spool_state(),
+                copter.mission.return_to_track_phase());
+            last_spool_log_ms = now_ms;
+        }
+        
         // motors have not completed spool up yet so relax navigation and position controllers
         pos_control->relax_velocity_controller_xy();
         pos_control->update_xy_controller();
