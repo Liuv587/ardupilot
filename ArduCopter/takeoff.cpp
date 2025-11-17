@@ -133,7 +133,7 @@ void _AutoTakeoff::run()
                 GCS_SEND_TEXT(MAV_SEVERITY_WARNING, 
                     "Auto takeoff blocked: auto_armed=false, throttle_zero=%d, phase=%d", 
                     copter.ap.throttle_zero, 
-                    copter.mission.return_to_track_phase());
+                    (int)copter.mode_auto.mission.return_to_track_phase());
             }
             last_warning_ms = now_ms;
         }
@@ -165,7 +165,7 @@ void _AutoTakeoff::run()
             GCS_SEND_TEXT(MAV_SEVERITY_INFO, 
                 "Auto takeoff: waiting for motor spool up, state=%d, phase=%d", 
                 (int)motors->get_spool_state(),
-                copter.mission.return_to_track_phase());
+                (int)copter.mode_auto.mission.return_to_track_phase());
             last_spool_log_ms = now_ms;
         }
         

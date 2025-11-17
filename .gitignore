@@ -176,6 +176,10 @@ autotest_result_*_junit.xml
 /libraries/AP_HAL_ESP32/targets/esp32/esp-idf/sdkconfig
 /libraries/AP_HAL_ESP32/targets/esp32s3/esp-idf/sdkconfig
 
-# Ignore user documentation files (Chinese Markdown files)
+# Ignore user documentation files (Chinese Markdown files in root directory)
+# Pattern matches any .md file containing Chinese characters or specific prefixes
 断点续飞*.md
-ADRC算法介绍.md
+断点参数化*.md
+ADRC算法*.md
+# Add more patterns here as needed, e.g.:
+# 其他文档*.md
