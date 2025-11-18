@@ -2,6 +2,7 @@
 #include <AP_HAL/AP_HAL.h>
 #include <AP_Math/AP_Math.h>
 #include <AC_PID/AC_PID.h>
+#include <AC_ADRC/AC_ADRC.h>
 #include <AP_Scheduler/AP_Scheduler.h>
 
 // table of user settable parameters
@@ -317,6 +318,25 @@ const AP_Param::GroupInfo AC_AttitudeControl_Multi::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("THR_G_BOOST", 7, AC_AttitudeControl_Multi, _throttle_gain_boost, 0.0f),
 
+    // @Param: ADRC_ENABLE
+    // @DisplayName: Enable ADRC rate controller
+    // @Description: Enable Active Disturbance Rejection Control (ADRC) for rate control. When enabled, ADRC will be used instead of PID for roll, pitch, and yaw rate control.
+    // @Values: 0:Disabled (use PID), 1:Enabled (use ADRC)
+    // @User: Advanced
+    AP_GROUPINFO("ADRC_ENABLE", 8, AC_AttitudeControl_Multi, _adrc_enable, 0),
+
+    // @Group: ADRC_RLL_
+    // @Path: AC_ADRC.cpp
+    AP_SUBGROUPINFO(_adrc_rate_roll, "ADRC_RLL_", 9, AC_AttitudeControl_Multi, AC_ADRC),
+
+    // @Group: ADRC_PIT_
+    // @Path: AC_ADRC.cpp
+    AP_SUBGROUPINFO(_adrc_rate_pitch, "ADRC_PIT_", 10, AC_AttitudeControl_Multi, AC_ADRC),
+
+    // @Group: ADRC_YAW_
+    // @Path: AC_ADRC.cpp
+    AP_SUBGROUPINFO(_adrc_rate_yaw, "ADRC_YAW_", 11, AC_AttitudeControl_Multi, AC_ADRC),
+
     AP_GROUPEND
 };
 
@@ -455,14 +475,33 @@ void AC_AttitudeControl_Multi::rate_controller_run_dt(const Vector3f& gyro, floa
     _rate_gyro = gyro;
     _rate_gyro_time_us = AP_HAL::micros64();
 
-    _motors.set_roll(get_rate_roll_pid().update_all(ang_vel_body.x, gyro.x,  dt, _motors.limit.roll, _pd_scale.x) + _actuator_sysid.x);
-    _motors.set_roll_ff(get_rate_roll_pid().get_ff());
+    // 根据ADRC启用标志选择使用PID或ADRC控制器
+    if (_adrc_enable != 0) {
+        // 使用ADRC控制器
+        float roll_output = _adrc_rate_roll.update_all(ang_vel_body.x, gyro.x, dt);
+        float pitch_output = _adrc_rate_pitch.update_all(ang_vel_body.y, gyro.y, dt);
+        float yaw_output = _adrc_rate_yaw.update_all(ang_vel_body.z, gyro.z, dt);
 
-    _motors.set_pitch(get_rate_pitch_pid().update_all(ang_vel_body.y, gyro.y,  dt, _motors.limit.pitch, _pd_scale.y) + _actuator_sysid.y);
-    _motors.set_pitch_ff(get_rate_pitch_pid().get_ff());
+        // 应用PD缩放和系统识别输入
+        _motors.set_roll(roll_output * _pd_scale.x + _actuator_sysid.x);
+        _motors.set_roll_ff(_adrc_rate_roll.get_ff() * _feedforward_scalar);  // ADRC前馈项
 
-    _motors.set_yaw(get_rate_yaw_pid().update_all(ang_vel_body.z, gyro.z,  dt, _motors.limit.yaw, _pd_scale.z) + _actuator_sysid.z);
-    _motors.set_yaw_ff(get_rate_yaw_pid().get_ff()*_feedforward_scalar);
+        _motors.set_pitch(pitch_output * _pd_scale.y + _actuator_sysid.y);
+        _motors.set_pitch_ff(_adrc_rate_pitch.get_ff() * _feedforward_scalar);
+
+        _motors.set_yaw(yaw_output * _pd_scale.z + _actuator_sysid.z);
+        _motors.set_yaw_ff(_adrc_rate_yaw.get_ff() * _feedforward_scalar);  // ADRC前馈项
+    } else {
+        // 使用传统PID控制器
+        _motors.set_roll(get_rate_roll_pid().update_all(ang_vel_body.x, gyro.x,  dt, _motors.limit.roll, _pd_scale.x) + _actuator_sysid.x);
+        _motors.set_roll_ff(get_rate_roll_pid().get_ff());
+
+        _motors.set_pitch(get_rate_pitch_pid().update_all(ang_vel_body.y, gyro.y,  dt, _motors.limit.pitch, _pd_scale.y) + _actuator_sysid.y);
+        _motors.set_pitch_ff(get_rate_pitch_pid().get_ff());
+
+        _motors.set_yaw(get_rate_yaw_pid().update_all(ang_vel_body.z, gyro.z,  dt, _motors.limit.yaw, _pd_scale.z) + _actuator_sysid.z);
+        _motors.set_yaw_ff(get_rate_yaw_pid().get_ff()*_feedforward_scalar);
+    }
 
     _pd_scale_used = _pd_scale;
 
@@ -475,6 +514,13 @@ void AC_AttitudeControl_Multi::rate_controller_target_reset()
     _sysid_ang_vel_body.zero();
     _actuator_sysid.zero();
     _pd_scale = VECTORF_111;
+    
+    // 如果使用ADRC，重置ADRC控制器状态
+    if (_adrc_enable != 0) {
+        _adrc_rate_roll.reset();
+        _adrc_rate_pitch.reset();
+        _adrc_rate_yaw.reset();
+    }
 }
 
 // run the rate controller using the configured _dt and latest gyro
