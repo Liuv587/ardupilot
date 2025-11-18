@@ -21,16 +21,18 @@ public:
         float kp;      // 比例增益 (proportional gain)
         float kd;      // 微分增益 (derivative gain)
         float b;       // 补偿系数 (compensation coefficient)
+        float kff;     // 前馈增益 (feedforward gain)
     };
 
     // Constructor for ADRC
-    AC_ADRC(float initial_wo, float initial_kp, float initial_kd, float initial_b);
+    AC_ADRC(float initial_wo, float initial_kp, float initial_kd, float initial_b, float initial_kff = 0.0f);
     AC_ADRC(const AC_ADRC::Defaults &defaults) :
         AC_ADRC(
             defaults.wo,
             defaults.kp,
             defaults.kd,
-            defaults.b
+            defaults.b,
+            defaults.kff
         ) { }
 
     CLASS_NO_COPY(AC_ADRC);
@@ -54,12 +56,15 @@ public:
     AP_Float &kD() { return _kd; }
     const AP_Float &b() const { return _b; }
     AP_Float &b() { return _b; }
+    const AP_Float &kFF() const { return _kff; }
+    AP_Float &kFF() { return _kff; }
 
     /// set accessors for parameters
     void set_wo(const float v) { _wo.set(v); update_observer_gains(); }
     void set_kP(const float v) { _kp.set(v); }
     void set_kD(const float v) { _kd.set(v); }
     void set_b(const float v) { _b.set(v); }
+    void set_kFF(const float v) { _kff.set(v); }
 
     /// get internal states (for logging/debugging)
     float get_z1() const { return _z1; }  // 输出估计值
@@ -78,6 +83,9 @@ public:
 
     /// get info structure (for logging)
     const AP_PIDInfo& get_adrc_info(void) const { return _adrc_info; }
+    
+    /// get feedforward output
+    float get_ff() const { return _adrc_info.FF; }
 
     /// parameter var table
     static const struct AP_Param::GroupInfo var_info[];
@@ -108,6 +116,7 @@ protected:
     AP_Float _kp;      // 比例增益 (proportional gain)
     AP_Float _kd;      // 微分增益 (derivative gain)
     AP_Float _b;       // 补偿系数 (compensation coefficient)
+    AP_Float _kff;     // 前馈增益 (feedforward gain)
 
     // ESO gains (calculated from wo)
     float _beta01;     // β01 = 3*wo
@@ -135,5 +144,8 @@ private:
     const float default_kp;
     const float default_kd;
     const float default_b;
+    const float default_kff;
+    
+    float _target;     // 保存目标值用于前馈计算
 };
 

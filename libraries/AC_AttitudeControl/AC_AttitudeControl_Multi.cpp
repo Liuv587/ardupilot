@@ -484,13 +484,13 @@ void AC_AttitudeControl_Multi::rate_controller_run_dt(const Vector3f& gyro, floa
 
         // 应用PD缩放和系统识别输入
         _motors.set_roll(roll_output * _pd_scale.x + _actuator_sysid.x);
-        _motors.set_roll_ff(0.0f);  // ADRC不使用前馈（扰动补偿已包含在控制律中）
+        _motors.set_roll_ff(_adrc_rate_roll.get_ff() * _feedforward_scalar);  // ADRC前馈项
 
         _motors.set_pitch(pitch_output * _pd_scale.y + _actuator_sysid.y);
-        _motors.set_pitch_ff(0.0f);
+        _motors.set_pitch_ff(_adrc_rate_pitch.get_ff() * _feedforward_scalar);
 
         _motors.set_yaw(yaw_output * _pd_scale.z + _actuator_sysid.z);
-        _motors.set_yaw_ff(0.0f);
+        _motors.set_yaw_ff(_adrc_rate_yaw.get_ff() * _feedforward_scalar);  // ADRC前馈项
     } else {
         // 使用传统PID控制器
         _motors.set_roll(get_rate_roll_pid().update_all(ang_vel_body.x, gyro.x,  dt, _motors.limit.roll, _pd_scale.x) + _actuator_sysid.x);

@@ -150,10 +150,10 @@ protected:
     };
 
     // ADRC controllers (自抗扰控制器)
-    // Default parameters: wo=10.0, kp=0.5, kd=0.05, b=1.0
-    AC_ADRC                _adrc_rate_roll{10.0f, 0.5f, 0.05f, 1.0f};
-    AC_ADRC                _adrc_rate_pitch{10.0f, 0.5f, 0.05f, 1.0f};
-    AC_ADRC                _adrc_rate_yaw{10.0f, 0.5f, 0.05f, 1.0f};
+    // Default parameters: wo=10.0, kp=0.5, kd=0.05, b=1.0, kff=0.0
+    AC_ADRC                _adrc_rate_roll{10.0f, 0.5f, 0.05f, 1.0f, 0.0f};
+    AC_ADRC                _adrc_rate_pitch{10.0f, 0.5f, 0.05f, 1.0f, 0.0f};
+    AC_ADRC                _adrc_rate_yaw{10.0f, 0.5f, 0.05f, 1.0f, 0.0f};
 
     AP_Float              _thr_mix_man;     // throttle vs attitude control prioritisation used when using manual throttle (higher values mean we prioritise attitude control over throttle)
     AP_Float              _thr_mix_min;     // throttle vs attitude control prioritisation used when landing (higher values mean we prioritise attitude control over throttle)

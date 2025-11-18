@@ -39,15 +39,24 @@ const AP_Param::GroupInfo AC_ADRC::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO_FLAGS_DEFAULT_POINTER("B", 3, AC_ADRC, _b, default_b),
 
+    // @Param: FF
+    // @DisplayName: ADRC FeedForward Gain
+    // @Description: FeedForward gain (kff) for ADRC. Produces an output value that is proportional to the target rate. Higher values provide faster response to target changes. For yaw axis, typical values are 0.3-2.0. Values above 1.0 may be needed for fast yaw response matching PID performance.
+    // @Range: 0.0 5.0
+    // @Increment: 0.01
+    // @User: Standard
+    AP_GROUPINFO_FLAGS_DEFAULT_POINTER("FF", 4, AC_ADRC, _kff, default_kff),
+
     AP_GROUPEND
 };
 
 // Constructor
-AC_ADRC::AC_ADRC(float initial_wo, float initial_kp, float initial_kd, float initial_b) :
+AC_ADRC::AC_ADRC(float initial_wo, float initial_kp, float initial_kd, float initial_b, float initial_kff) :
     default_wo(initial_wo),
     default_kp(initial_kp),
     default_kd(initial_kd),
-    default_b(initial_b)
+    default_b(initial_b),
+    default_kff(initial_kff)
 {
     // load parameter values from eeprom
     AP_Param::setup_object_defaults(this, var_info);
@@ -60,6 +69,7 @@ AC_ADRC::AC_ADRC(float initial_wo, float initial_kp, float initial_kd, float ini
 
     // initialize info structure
     memset(&_adrc_info, 0, sizeof(_adrc_info));
+    _target = 0.0f;
 }
 
 // reset - reset all internal states
@@ -72,6 +82,7 @@ void AC_ADRC::reset()
     _v2 = 0.0f;
     _u0 = 0.0f;
     _disturbance_compensation = 0.0f;
+    _target = 0.0f;
 }
 
 // update_observer_gains - update ESO gains based on observer bandwidth
@@ -190,13 +201,22 @@ float AC_ADRC::update_all(float target, float measurement, float dt)
     // Step 3: 非线性状态误差反馈 (NLSEF)
     float output = nonlinear_state_error_feedback(dt);
 
+    // 保存目标值用于前馈计算
+    _target = target;
+
+    // 计算前馈项：使用原始target以获得最快的响应
+    // 对于快速响应，使用原始target比使用过滤后的v1更好
+    const float feedforward = target * _kff.get();
+    
+    // 注意：前馈值会通过_feedforward_scalar进一步缩放（在AC_AttitudeControl_Multi中）
+
     // 更新信息结构（用于日志记录）
     _adrc_info.target = target;
     _adrc_info.actual = measurement;
     _adrc_info.error = _v1 - _z1;
     _adrc_info.P = _kp.get() * (_v1 - _z1);
     _adrc_info.D = _kd.get() * (_v2 - _z2);
-    _adrc_info.FF = -_disturbance_compensation;  // 扰动补偿作为前馈项
+    _adrc_info.FF = feedforward;  // 前馈项
 
     return output;
 }
