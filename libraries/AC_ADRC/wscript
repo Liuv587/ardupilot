@@ -1,0 +1,8 @@
+#!/usr/bin/env python
+# encoding: utf-8
+
+def build(bld):
+    # AC_ADRC库会被构建系统自动发现和编译
+    # 这个wscript文件确保目录被识别为库目录
+    pass
+

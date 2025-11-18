@@ -178,8 +178,16 @@ autotest_result_*_junit.xml
 
 # Ignore user documentation files (Chinese Markdown files in root directory)
 # Pattern matches any .md file containing Chinese characters or specific prefixes
-断点续飞*.md
-断点参数化*.md
-ADRC算法*.md
+/断点续飞*.md
+/断点参数化*.md
+/ADRC算法*.md
+# Ignore all markdown files in root directory except important ones
+/*.md
+!README.md
+!BUILD.md
+!CODE_OF_CONDUCT.md
+# Ignore Chinese markdown files in libraries/AC_ADRC/ directory
+/libraries/AC_ADRC/*.md
+!/libraries/AC_ADRC/README.md
 # Add more patterns here as needed, e.g.:
 # 其他文档*.md

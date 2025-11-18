@@ -5,6 +5,7 @@
 
 #include "AC_AttitudeControl.h"
 #include <AP_Motors/AP_MotorsMulticopter.h>
+#include <AC_ADRC/AC_ADRC.h>
 
 // default rate controller PID gains
 #ifndef AC_ATC_MULTI_RATE_RP_P
@@ -86,6 +87,9 @@ public:
     // set the PID notch sample rates
     void set_notch_sample_rate(float sample_rate) override;
 
+    // check if ADRC is enabled
+    bool is_adrc_enabled() const { return _adrc_enable != 0; }
+
     // user settable parameters
     static const struct AP_Param::GroupInfo var_info[];
 
@@ -145,10 +149,19 @@ protected:
         }
     };
 
+    // ADRC controllers (自抗扰控制器)
+    // Default parameters: wo=10.0, kp=0.5, kd=0.05, b=1.0
+    AC_ADRC                _adrc_rate_roll{10.0f, 0.5f, 0.05f, 1.0f};
+    AC_ADRC                _adrc_rate_pitch{10.0f, 0.5f, 0.05f, 1.0f};
+    AC_ADRC                _adrc_rate_yaw{10.0f, 0.5f, 0.05f, 1.0f};
+
     AP_Float              _thr_mix_man;     // throttle vs attitude control prioritisation used when using manual throttle (higher values mean we prioritise attitude control over throttle)
     AP_Float              _thr_mix_min;     // throttle vs attitude control prioritisation used when landing (higher values mean we prioritise attitude control over throttle)
     AP_Float              _thr_mix_max;     // throttle vs attitude control prioritisation used during active flight (higher values mean we prioritise attitude control over throttle)
 
     // angle_p/pd boost multiplier
     AP_Float              _throttle_gain_boost;
+
+    // ADRC enable flag
+    AP_Int8               _adrc_enable;     // 0=disabled (use PID), 1=enabled (use ADRC)
 };
