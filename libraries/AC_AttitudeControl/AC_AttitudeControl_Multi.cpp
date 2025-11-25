@@ -477,20 +477,40 @@ void AC_AttitudeControl_Multi::rate_controller_run_dt(const Vector3f& gyro, floa
 
     // 根据ADRC启用标志选择使用PID或ADRC控制器
     if (_adrc_enable != 0) {
-        // 使用ADRC控制器
-        float roll_output = _adrc_rate_roll.update_all(ang_vel_body.x, gyro.x, dt);
+        // 混合模式调试：Roll 使用 PID，Yaw/Pitch 使用 ADRC
+        
+        // Roll - 使用 PID
+        _motors.set_roll(get_rate_roll_pid().update_all(ang_vel_body.x, gyro.x,  dt, _motors.limit.roll, _pd_scale.x) + _actuator_sysid.x);
+        _motors.set_roll_ff(get_rate_roll_pid().get_ff());
+
+        // Pitch - 开启 ADRC 调试
         float pitch_output = _adrc_rate_pitch.update_all(ang_vel_body.y, gyro.y, dt);
-        float yaw_output = _adrc_rate_yaw.update_all(ang_vel_body.z, gyro.z, dt);
-
-        // 应用PD缩放和系统识别输入
-        _motors.set_roll(roll_output * _pd_scale.x + _actuator_sysid.x);
-        _motors.set_roll_ff(_adrc_rate_roll.get_ff() * _feedforward_scalar);  // ADRC前馈项
-
         _motors.set_pitch(pitch_output * _pd_scale.y + _actuator_sysid.y);
         _motors.set_pitch_ff(_adrc_rate_pitch.get_ff() * _feedforward_scalar);
 
+        // Yaw - 使用 ADRC (已验证)
+        float yaw_output = _adrc_rate_yaw.update_all(ang_vel_body.z, gyro.z, dt);
         _motors.set_yaw(yaw_output * _pd_scale.z + _actuator_sysid.z);
         _motors.set_yaw_ff(_adrc_rate_yaw.get_ff() * _feedforward_scalar);  // ADRC前馈项
+
+        // // 诊断日志：每 200 次循环输出一次（约 0.5 秒），如果误差大则更频繁
+        // static uint32_t log_counter = 0;
+        // // 监控 Pitch 轴误差
+        // float pitch_error = fabsf(ang_vel_body.y - gyro.y);
+
+        // // bool fast_log = pitch_error > 0.5f; // 误差超过 0.5 rad/s 时加速日志
+
+        // if (++log_counter % (fast_log ? 40 : 200) == 0) {
+        //     // 发送到地面站（QGroundControl）
+        //     // 改为监控 Pitch 轴状态
+        //     float z3_pitch = _adrc_rate_pitch.get_z3();
+            
+        //     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ADRC_PIT: t=%.2f a=%.2f out=%.2f z3=%.2f",
+        //                   (double)ang_vel_body.y, // Target
+        //                   (double)gyro.y,         // Actual
+        //                   (double)pitch_output,   // Final Output
+        //                   (double)z3_pitch);      // Disturbance Estimate
+        // }
     } else {
         // 使用传统PID控制器
         _motors.set_roll(get_rate_roll_pid().update_all(ang_vel_body.x, gyro.x,  dt, _motors.limit.roll, _pd_scale.x) + _actuator_sysid.x);

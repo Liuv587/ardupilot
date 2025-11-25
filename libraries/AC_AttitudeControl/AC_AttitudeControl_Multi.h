@@ -6,6 +6,7 @@
 #include "AC_AttitudeControl.h"
 #include <AP_Motors/AP_MotorsMulticopter.h>
 #include <AC_ADRC/AC_ADRC.h>
+#include <GCS_MAVLink/GCS.h>
 
 // default rate controller PID gains
 #ifndef AC_ATC_MULTI_RATE_RP_P
@@ -150,10 +151,12 @@ protected:
     };
 
     // ADRC controllers (自抗扰控制器)
-    // Default parameters: wo=10.0, kp=0.5, kd=0.05, b=1.0, kff=0.0
-    AC_ADRC                _adrc_rate_roll{10.0f, 0.5f, 0.05f, 1.0f, 0.0f};
-    AC_ADRC                _adrc_rate_pitch{10.0f, 0.5f, 0.05f, 1.0f, 0.0f};
-    AC_ADRC                _adrc_rate_yaw{10.0f, 0.5f, 0.05f, 1.0f, 0.0f};
+    // Default parameters: wo=20.0, kp=1.0, kd=0.5, b=5.0, kff=0.5
+    // 调试状态：Yaw (10, 0.5, 0.05, 40, 0.1) 已验证
+    // Pitch (20, 1.5, 0.1, 20, 0.1) 回退发散，减小刚度和补偿力度以消震
+    AC_ADRC                _adrc_rate_roll{3.0f, 0.5f, 0.05f, 40.0f, 0.1f};
+    AC_ADRC                _adrc_rate_pitch{20.0f, 1.5f, 0.1f, 20.0f, 0.1f};
+    AC_ADRC                _adrc_rate_yaw{10.0f, 0.5f, 0.05f, 40.0f, 0.1f};
 
     AP_Float              _thr_mix_man;     // throttle vs attitude control prioritisation used when using manual throttle (higher values mean we prioritise attitude control over throttle)
     AP_Float              _thr_mix_min;     // throttle vs attitude control prioritisation used when landing (higher values mean we prioritise attitude control over throttle)

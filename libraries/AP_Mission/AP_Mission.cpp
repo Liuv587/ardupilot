@@ -19,6 +19,12 @@
 #include <AC_Fence/AC_Fence.h>
 #include <AP_Logger/AP_Logger.h>
 
+// 屏蔽此文件中的所有 GCS_SEND_TEXT 输出
+#ifdef GCS_SEND_TEXT
+#undef GCS_SEND_TEXT
+#endif
+#define GCS_SEND_TEXT(severity, format, ...)
+
 const AP_Param::GroupInfo AP_Mission::var_info[] = {
 
     // @Param: TOTAL
@@ -53,17 +59,18 @@ const AP_Param::GroupInfo AP_Mission::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("RESUME_MODE", 3, AP_Mission, _resume_mode, 0),
 
-    // @Param: BP_LAT
-    // @DisplayName: Breakpoint Latitude
-    // @Description: Saved breakpoint latitude (degrees * 1e7). Set to 0 to clear.
+    // @Param: BP_PREV_IDX
+    // @DisplayName: Breakpoint Previous Waypoint Index
+    // @Description: Index of the last passed waypoint before breakpoint. -1 means no breakpoint.
     // @User: Advanced
-    AP_GROUPINFO("BP_LAT", 4, AP_Mission, _breakpoint_lat, 0),
+    AP_GROUPINFO("BP_PREV_IDX", 4, AP_Mission, _breakpoint_prev_wp_idx, -1),
 
-    // @Param: BP_LNG
-    // @DisplayName: Breakpoint Longitude
-    // @Description: Saved breakpoint longitude (degrees * 1e7). Set to 0 to clear.
+    // @Param: BP_DIST
+    // @DisplayName: Breakpoint Distance from Previous WP
+    // @Description: Distance (in centimeters) from the previous waypoint along the mission track
+    // @Units: cm
     // @User: Advanced
-    AP_GROUPINFO("BP_LNG", 5, AP_Mission, _breakpoint_lng, 0),
+    AP_GROUPINFO("BP_DIST", 5, AP_Mission, _breakpoint_dist_cm, 0),
 
     // @Param: BP_ALT
     // @DisplayName: Breakpoint Altitude
@@ -72,11 +79,11 @@ const AP_Param::GroupInfo AP_Mission::var_info[] = {
     // @User: Advanced
     AP_GROUPINFO("BP_ALT", 6, AP_Mission, _breakpoint_alt, 0),
 
-    // @Param: BP_WP_IDX
-    // @DisplayName: Breakpoint Waypoint Index
-    // @Description: Saved breakpoint waypoint index. -1 means no breakpoint.
+    // @Param: BP_TGT_IDX
+    // @DisplayName: Breakpoint Target Waypoint Index
+    // @Description: Index of the target waypoint when breakpoint was saved. -1 means no breakpoint.
     // @User: Advanced
-    AP_GROUPINFO("BP_WP_IDX", 7, AP_Mission, _breakpoint_wp_idx, -1),
+    AP_GROUPINFO("BP_TGT_IDX", 7, AP_Mission, _breakpoint_target_wp_idx, -1),
 
     // @Param: BP_VALID
     // @DisplayName: Breakpoint Valid
@@ -136,49 +143,73 @@ void AP_Mission::init()
 
     // If Mission Clear bit is set then it should clear the mission, otherwise retain the mission.
     if (option_is_set(Option::CLEAR_ON_BOOT)) {
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Clearing Mission");
         clear();
     }
 
     // 从参数加载断点信息（断电后恢复）
     const int8_t bp_flags = _breakpoint_valid_param.get();
-    if ((bp_flags & 0x01) && _breakpoint_wp_idx >= 0) {
-        _breakpoint_loc.lat = _breakpoint_lat;
-        _breakpoint_loc.lng = _breakpoint_lng;
-
-        Location::AltFrame stored_frame = Location::AltFrame::ABOVE_HOME;
-        switch ((bp_flags >> 1) & 0x03) {
-        case 0:
-            stored_frame = Location::AltFrame::ABSOLUTE;
-            break;
-        case 1:
-            stored_frame = Location::AltFrame::ABOVE_HOME;
-            break;
-        case 2:
-            stored_frame = Location::AltFrame::ABOVE_ORIGIN;
-            break;
-        case 3:
-            stored_frame = Location::AltFrame::ABOVE_TERRAIN;
-            break;
-        }
-
-        _breakpoint_loc.set_alt_cm(_breakpoint_alt, stored_frame);
-
-        if (stored_frame != Location::AltFrame::ABOVE_HOME) {
-            int32_t alt_home_cm;
-            if (_breakpoint_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, alt_home_cm)) {
-                _breakpoint_loc.set_alt_cm(alt_home_cm, Location::AltFrame::ABOVE_HOME);
-                _breakpoint_alt.set_and_save(_breakpoint_loc.alt);
-                const int8_t home_frame_bits = static_cast<int8_t>(_breakpoint_loc.get_alt_frame()) & 0x03;
-                _breakpoint_valid_param.set_and_save(static_cast<int8_t>(1 | (home_frame_bits << 1)));
-                GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint alt frame converted to HOME");
+    if ((bp_flags & 0x01) && _breakpoint_target_wp_idx >= 0) {
+        // 从参数读取断点信息
+        uint16_t prev_wp_idx = _breakpoint_prev_wp_idx;
+        float dist_m = _breakpoint_dist_cm * 0.01f; // 厘米转米
+        uint16_t target_wp_idx = _breakpoint_target_wp_idx;
+        
+        // 尝试根据索引和距离重新计算断点位置
+        bool calc_success = false;
+        
+        if (prev_wp_idx != AP_MISSION_CMD_INDEX_NONE && target_wp_idx != AP_MISSION_CMD_INDEX_NONE) {
+            Mission_Command prev_cmd, target_cmd;
+            if (read_cmd_from_storage(prev_wp_idx, prev_cmd) && 
+                read_cmd_from_storage(target_wp_idx, target_cmd) &&
+                is_nav_cmd(prev_cmd) && is_nav_cmd(target_cmd)) {
+                
+                Location prev_loc = prev_cmd.content.location;
+                Location target_loc = target_cmd.content.location;
+                
+                // 计算航段
+                Vector2f seg_vec = prev_loc.get_distance_NE(target_loc);
+                float seg_len = seg_vec.length();
+                
+                if (seg_len > 0.1f) {
+                    // 计算投影点
+                    float t = dist_m / seg_len;
+                    t = constrain_float(t, 0.0f, 1.0f);
+                    
+                    Vector2f proj_offset = seg_vec * t;
+                    _breakpoint_loc = prev_loc;
+                    _breakpoint_loc.offset(proj_offset.x, proj_offset.y);
+                    
+                    calc_success = true;
+                }
             }
         }
-
-        _breakpoint_nav_cmd.index = _breakpoint_wp_idx;
-        _breakpoint_valid = true;
-        GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint loaded from EEPROM (WP %d)", 
-                      (int)_breakpoint_wp_idx.get());
+        
+        if (calc_success) {
+            // 恢复高度坐标系
+            Location::AltFrame stored_frame = Location::AltFrame::ABOVE_HOME;
+            switch ((bp_flags >> 1) & 0x03) {
+            case 0:
+                stored_frame = Location::AltFrame::ABSOLUTE;
+                break;
+            case 1:
+                stored_frame = Location::AltFrame::ABOVE_HOME;
+                break;
+            case 2:
+                stored_frame = Location::AltFrame::ABOVE_ORIGIN;
+                break;
+            case 3:
+                stored_frame = Location::AltFrame::ABOVE_TERRAIN;
+                break;
+            }
+            
+            _breakpoint_loc.set_alt_cm(_breakpoint_alt, stored_frame);
+            
+            _breakpoint_nav_cmd.index = target_wp_idx;
+            _breakpoint_valid = true;
+        } else {
+            // 计算失败，清除断点
+            _breakpoint_valid = false;
+        }
     } else {
         _breakpoint_valid = false;
     }
@@ -3429,45 +3460,83 @@ void AP_Mission::set_breakpoint(const Location& loc)
 
     reset_return_state();
 
-    Location bp_loc = loc;
+    // 获取上一个通过的航点索引
+    uint16_t prev_wp_idx = _wp_index_history[LAST_WP_PASSED];
+    
+    // 计算从上一航点到当前位置的距离
+    float distance_m = 0.0f;
+    
+    if (prev_wp_idx != AP_MISSION_CMD_INDEX_NONE) {
+        Mission_Command prev_cmd;
+        if (read_cmd_from_storage(prev_wp_idx, prev_cmd) && 
+            is_nav_cmd(prev_cmd) &&
+            (prev_cmd.content.location.lat != 0 || prev_cmd.content.location.lng != 0)) {
+            
+            Location prev_loc = prev_cmd.content.location;
+            Location next_loc = resume_cmd.content.location;
+            
+            // 计算当前位置在航段上的投影距离
+            Vector2f seg_vec = prev_loc.get_distance_NE(next_loc);
+            Vector2f curr_vec = prev_loc.get_distance_NE(loc);
+            
+            float seg_len_sq = seg_vec.length_squared();
+            
+            if (seg_len_sq > 0.01f) { // 避免除以零
+                // 计算投影系数 t
+                float t = (curr_vec * seg_vec) / seg_len_sq;
+                // 限制在航段范围内
+                t = constrain_float(t, 0.0f, 1.0f);
+                
+                // 计算沿航线的距离
+                float segment_length = sqrtf(seg_len_sq);
+                distance_m = t * segment_length;
+            } else {
+                // 航段太短，使用直接距离
+                distance_m = prev_loc.get_distance(loc);
+            }
+        } else {
+            // 无法读取上一航点，使用当前位置到目标的距离
+            distance_m = 0.0f;
+            prev_wp_idx = AP_MISSION_CMD_INDEX_NONE;
+        }
+    }
+    
+    // 保存高度（使用当前实际高度，更安全）
+    int32_t alt_cm = loc.alt;
+    Location::AltFrame alt_frame = loc.get_alt_frame();
+    
+    // 尝试转换为 ABOVE_HOME 坐标系
     int32_t alt_above_home_cm;
     if (loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, alt_above_home_cm)) {
-        bp_loc.set_alt_cm(alt_above_home_cm, Location::AltFrame::ABOVE_HOME);
+        alt_cm = alt_above_home_cm;
+        alt_frame = Location::AltFrame::ABOVE_HOME;
     } else {
-        // 如果无法转换到HOME坐标系，退化为相对于EKF原点
+        // 如果无法转换到HOME坐标系，尝试转换为相对于EKF原点
         int32_t alt_above_origin_cm;
         if (loc.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN, alt_above_origin_cm)) {
-            bp_loc.set_alt_cm(alt_above_origin_cm, Location::AltFrame::ABOVE_ORIGIN);
+            alt_cm = alt_above_origin_cm;
+            alt_frame = Location::AltFrame::ABOVE_ORIGIN;
         }
         GCS_SEND_TEXT(MAV_SEVERITY_WARNING, "Mission: Breakpoint alt frame fallback (HOME not available)");
     }
 
-    int32_t dbg_alt_home = 0;
-    int32_t dbg_alt_origin = 0;
-    bool dbg_home_ok = bp_loc.get_alt_cm(Location::AltFrame::ABOVE_HOME, dbg_alt_home);
-    bool dbg_origin_ok = bp_loc.get_alt_cm(Location::AltFrame::ABOVE_ORIGIN, dbg_alt_origin);
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO,
-                  "Mission: BP set raw_alt=%d frame=%d alt_home=%d(ok=%d) alt_origin=%d(ok=%d)",
-                  (int)bp_loc.alt,
-                  (int)bp_loc.get_alt_frame(),
-                  (int)dbg_alt_home,
-                  (int)dbg_home_ok,
-                  (int)dbg_alt_origin,
-                  (int)dbg_origin_ok);
-
-    _breakpoint_loc = bp_loc;
+    // 保存内部状态
     _breakpoint_valid = true;
     _breakpoint_nav_cmd = resume_cmd;
+    // 暂时保存 loc 用于兼容（可能某些地方会用到，但主要依赖参数）
+    _breakpoint_loc = loc;
 
     // 保存断点信息到参数（持久化，断电不丢失）
-    _breakpoint_lat.set_and_save(_breakpoint_loc.lat);
-    _breakpoint_lng.set_and_save(_breakpoint_loc.lng);
-    _breakpoint_alt.set_and_save(_breakpoint_loc.alt);
-    _breakpoint_wp_idx.set_and_save(resume_cmd.index);
-    const int8_t frame_bits = static_cast<int8_t>(_breakpoint_loc.get_alt_frame()) & 0x03;
+    _breakpoint_prev_wp_idx.set_and_save(prev_wp_idx);
+    _breakpoint_dist_cm.set_and_save(static_cast<int32_t>(distance_m * 100.0f)); // 米转厘米
+    _breakpoint_alt.set_and_save(alt_cm);
+    _breakpoint_target_wp_idx.set_and_save(resume_cmd.index);
+    
+    const int8_t frame_bits = static_cast<int8_t>(alt_frame) & 0x03;
     _breakpoint_valid_param.set_and_save(static_cast<int8_t>(1 | (frame_bits << 1)));
 
-    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint saved to EEPROM (WP %d)", (int)resume_cmd.index);
+    GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint saved (prev_wp=%d, dist=%.1fm, target_wp=%d)", 
+                  (int)prev_wp_idx, (double)distance_m, (int)resume_cmd.index);
 }
 
 void AP_Mission::clear_breakpoint()
@@ -3477,10 +3546,10 @@ void AP_Mission::clear_breakpoint()
     _breakpoint_loc.zero();
     
     // 清除参数（持久化）
-    _breakpoint_lat.set_and_save(0);
-    _breakpoint_lng.set_and_save(0);
+    _breakpoint_prev_wp_idx.set_and_save(-1);
+    _breakpoint_dist_cm.set_and_save(0);
     _breakpoint_alt.set_and_save(0);
-    _breakpoint_wp_idx.set_and_save(-1);
+    _breakpoint_target_wp_idx.set_and_save(-1);
     _breakpoint_valid_param.set_and_save(0);
     
     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "Mission: Breakpoint cleared from EEPROM");

@@ -440,11 +440,6 @@ void ModeAuto::takeoff_start(const Location& dest_loc)
     bool alt_target_terrain = false;
     float current_alt_cm = inertial_nav.get_position_z_up_cm();
     float terrain_offset;   // terrain's altitude in cm above the ekf origin
-    bool alt_conversion_success = true;
-    bool used_fallback = false;
-    const uint8_t dest_rel_flag = dest_loc.relative_alt;
-    const uint8_t dest_origin_flag = dest_loc.origin_alt;
-    const uint8_t dest_terrain_flag = dest_loc.terrain_alt;
 
     if ((dest_loc.get_alt_frame() == Location::AltFrame::ABOVE_TERRAIN) && wp_nav->get_terrain_offset(terrain_offset)) {
         // subtract terrain offset to convert vehicle's alt-above-ekf-origin to alt-above-terrain
@@ -464,8 +459,6 @@ void ModeAuto::takeoff_start(const Location& dest_loc)
             // HOME点未设置，使用当前高度+目标相对高度作为fallback
             gcs().send_text(MAV_SEVERITY_WARNING, "Takeoff: HOME not set, using current alt as reference");
             alt_target_cm = current_alt_cm + dest_loc.alt;
-            alt_conversion_success = false;
-            used_fallback = true;
         }
     } else {
         // set horizontal target
@@ -479,28 +472,19 @@ void ModeAuto::takeoff_start(const Location& dest_loc)
             LOGGER_WRITE_ERROR(LogErrorSubsystem::TERRAIN, LogErrorCode::MISSING_TERRAIN_DATA);
             // fall back to altitude above current altitude
             alt_target_cm = current_alt_cm + dest_loc.alt;
-            alt_conversion_success = false;
-            used_fallback = true;
         }
     }
 
     // sanity check target
     int32_t alt_target_min_cm = current_alt_cm + (copter.ap.land_complete ? 100 : 0);
-    int32_t alt_target_pre_clamp = alt_target_cm;
     alt_target_cm = MAX(alt_target_cm, alt_target_min_cm);
 
     // 调试信息：显示最终的起飞目标高度
     gcs().send_text(MAV_SEVERITY_INFO,
-                    "takeoff_start: final=%d cm (pre=%d, min=%d) current=%d cm flags r/o/t=%d/%d/%d conv_ok=%d fallback=%d",
+                    "takeoff_start: final=%d cm (min=%d) current=%d cm",
                     (int)alt_target_cm,
-                    (int)alt_target_pre_clamp,
                     (int)alt_target_min_cm,
-                    (int)current_alt_cm,
-                    (int)dest_rel_flag,
-                    (int)dest_origin_flag,
-                    (int)dest_terrain_flag,
-                    (int)alt_conversion_success,
-                    (int)used_fallback);
+                    (int)current_alt_cm);
 
     // initialise yaw
     auto_yaw.set_mode(AutoYaw::Mode::HOLD);

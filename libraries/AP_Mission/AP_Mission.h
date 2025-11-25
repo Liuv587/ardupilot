@@ -934,11 +934,11 @@ private:
     AP_Int16                _options;    // bitmask options for missions, currently for mission clearing on reboot but can be expanded as required
     AP_Int8                 _restart;   // controls mission starting point when entering Auto mode (either restart from beginning of mission or resume from last command run)
     AP_Int8                 _resume_mode;  // controls how vehicle returns to mission after interruption (0=direct, 1=return to track, 2=return to track with rewind)
-    AP_Int32                _breakpoint_lat;    // 断点纬度（* 1e7）
-    AP_Int32                _breakpoint_lng;    // 断点经度（* 1e7）
-    AP_Int32                _breakpoint_alt;    // 断点高度（cm）
-    AP_Int16                _breakpoint_wp_idx; // 断点对应的航点索引
-    AP_Int8                 _breakpoint_valid_param; // 断点是否有效（0/1）
+    AP_Int16                _breakpoint_prev_wp_idx;   // 上一个通过的航点索引
+    AP_Int32                _breakpoint_dist_cm;        // 从上一航点沿航线的距离（厘米）
+    AP_Int32                _breakpoint_alt;            // 断点高度（cm）
+    AP_Int16                _breakpoint_target_wp_idx;  // 目标航点索引
+    AP_Int8                 _breakpoint_valid_param;    // 断点是否有效（0/1）
 
     // internal variables
     bool                    _force_resume;  // when set true it forces mission to resume irrespective of MIS_RESTART param.
