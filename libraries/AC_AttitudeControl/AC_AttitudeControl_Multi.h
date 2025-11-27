@@ -90,6 +90,9 @@ public:
 
     // check if ADRC is enabled
     bool is_adrc_enabled() const { return _adrc_enable != 0; }
+    bool is_adrc_roll_enabled() const { return _adrc_enable != 0 && _adrc_roll_enable != 0; }
+    bool is_adrc_pitch_enabled() const { return _adrc_enable != 0 && _adrc_pitch_enable != 0; }
+    bool is_adrc_yaw_enabled() const { return _adrc_enable != 0 && _adrc_yaw_enable != 0; }
 
     // user settable parameters
     static const struct AP_Param::GroupInfo var_info[];
@@ -165,6 +168,9 @@ protected:
     // angle_p/pd boost multiplier
     AP_Float              _throttle_gain_boost;
 
-    // ADRC enable flag
-    AP_Int8               _adrc_enable;     // 0=disabled (use PID), 1=enabled (use ADRC)
+    // ADRC enable flags
+    AP_Int8               _adrc_enable;        // ADRC总开关: 0=禁用所有ADRC, 1=启用(使用各轴独立开关)
+    AP_Int8               _adrc_roll_enable;   // Roll轴控制模式: 0=PID, 1=ADRC
+    AP_Int8               _adrc_pitch_enable;  // Pitch轴控制模式: 0=PID, 1=ADRC
+    AP_Int8               _adrc_yaw_enable;    // Yaw轴控制模式: 0=PID, 1=ADRC
 };

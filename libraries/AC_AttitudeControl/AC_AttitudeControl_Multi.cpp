@@ -319,12 +319,12 @@ const AP_Param::GroupInfo AC_AttitudeControl_Multi::var_info[] = {
     AP_GROUPINFO("THR_G_BOOST", 7, AC_AttitudeControl_Multi, _throttle_gain_boost, 0.0f),
 
     // @Param: ADRC_ENABLE
-    // @DisplayName: Enable ADRC rate controller
-    // @Description: Enable Active Disturbance Rejection Control (ADRC) for rate control. When enabled, ADRC will be used instead of PID for roll, pitch, and yaw rate control.
-    // @Values: 0:Disabled (use PID), 1:Enabled (use ADRC)
+    // @DisplayName: ADRC Master Enable
+    // @Description: Master switch for ADRC. When disabled (0), all axes use PID. When enabled (1), each axis uses its individual enable switch (ADRC_RLL_EN, ADRC_PIT_EN, ADRC_YAW_EN).
+    // @Values: 0:Disabled (all PID), 1:Enabled (use individual axis switches)
     // @User: Advanced
-    AP_GROUPINFO("ADRC_ENABLE", 8, AC_AttitudeControl_Multi, _adrc_enable, 0),
-
+    AP_GROUPINFO("ADRC_ENABLE", 8, AC_AttitudeControl_Multi, _adrc_enable, 1),
+    
     // @Group: ADRC_RLL_
     // @Path: AC_ADRC.cpp
     AP_SUBGROUPINFO(_adrc_rate_roll, "ADRC_RLL_", 9, AC_AttitudeControl_Multi, AC_ADRC),
@@ -336,6 +336,27 @@ const AP_Param::GroupInfo AC_AttitudeControl_Multi::var_info[] = {
     // @Group: ADRC_YAW_
     // @Path: AC_ADRC.cpp
     AP_SUBGROUPINFO(_adrc_rate_yaw, "ADRC_YAW_", 11, AC_AttitudeControl_Multi, AC_ADRC),
+
+    // @Param: ADRC_RLL_EN
+    // @DisplayName: Enable ADRC for Roll axis
+    // @Description: Enable Active Disturbance Rejection Control (ADRC) for roll rate control. Requires ADRC_ENABLE=1. 0=PID, 1=ADRC
+    // @Values: 0:PID, 1:ADRC
+    // @User: Advanced
+    AP_GROUPINFO("ADRC_RLL_EN", 12, AC_AttitudeControl_Multi, _adrc_roll_enable, 1),
+
+    // @Param: ADRC_PIT_EN
+    // @DisplayName: Enable ADRC for Pitch axis
+    // @Description: Enable Active Disturbance Rejection Control (ADRC) for pitch rate control. Requires ADRC_ENABLE=1. 0=PID, 1=ADRC
+    // @Values: 0:PID, 1:ADRC
+    // @User: Advanced
+    AP_GROUPINFO("ADRC_PIT_EN", 13, AC_AttitudeControl_Multi, _adrc_pitch_enable, 1),
+
+    // @Param: ADRC_YAW_EN
+    // @DisplayName: Enable ADRC for Yaw axis
+    // @Description: Enable Active Disturbance Rejection Control (ADRC) for yaw rate control. Requires ADRC_ENABLE=1. 0=PID, 1=ADRC
+    // @Values: 0:PID, 1:ADRC
+    // @User: Advanced
+    AP_GROUPINFO("ADRC_YAW_EN", 14, AC_AttitudeControl_Multi, _adrc_yaw_enable, 1),
 
     AP_GROUPEND
 };
@@ -475,52 +496,43 @@ void AC_AttitudeControl_Multi::rate_controller_run_dt(const Vector3f& gyro, floa
     _rate_gyro = gyro;
     _rate_gyro_time_us = AP_HAL::micros64();
 
-    // 根据ADRC启用标志选择使用PID或ADRC控制器
-    if (_adrc_enable != 0) {
-        // 混合模式调试：Roll 使用 PID，Yaw/Pitch 使用 ADRC
-        
+    // 根据各轴ADRC启用标志选择使用PID或ADRC控制器
+    // 总开关 _adrc_enable 必须为1，且各轴开关为1时才使用ADRC
+    
+    // Roll轴控制
+    if (_adrc_enable != 0 && _adrc_roll_enable != 0) {
+        // Roll - 使用 ADRC
+        float roll_output = _adrc_rate_roll.update_all(ang_vel_body.x, gyro.x, dt);
+        _motors.set_roll(roll_output * _pd_scale.x + _actuator_sysid.x);
+        _motors.set_roll_ff(_adrc_rate_roll.get_ff() * _feedforward_scalar);
+    } else {
         // Roll - 使用 PID
-        _motors.set_roll(get_rate_roll_pid().update_all(ang_vel_body.x, gyro.x,  dt, _motors.limit.roll, _pd_scale.x) + _actuator_sysid.x);
+        _motors.set_roll(get_rate_roll_pid().update_all(ang_vel_body.x, gyro.x, dt, _motors.limit.roll, _pd_scale.x) + _actuator_sysid.x);
         _motors.set_roll_ff(get_rate_roll_pid().get_ff());
+    }
 
-        // Pitch - 开启 ADRC 调试
+    // Pitch轴控制
+    if (_adrc_enable != 0 && _adrc_pitch_enable != 0) {
+        // Pitch - 使用 ADRC
         float pitch_output = _adrc_rate_pitch.update_all(ang_vel_body.y, gyro.y, dt);
         _motors.set_pitch(pitch_output * _pd_scale.y + _actuator_sysid.y);
         _motors.set_pitch_ff(_adrc_rate_pitch.get_ff() * _feedforward_scalar);
+    } else {
+        // Pitch - 使用 PID
+        _motors.set_pitch(get_rate_pitch_pid().update_all(ang_vel_body.y, gyro.y, dt, _motors.limit.pitch, _pd_scale.y) + _actuator_sysid.y);
+        _motors.set_pitch_ff(get_rate_pitch_pid().get_ff());
+    }
 
-        // Yaw - 使用 ADRC (已验证)
+    // Yaw轴控制
+    if (_adrc_enable != 0 && _adrc_yaw_enable != 0) {
+        // Yaw - 使用 ADRC
         float yaw_output = _adrc_rate_yaw.update_all(ang_vel_body.z, gyro.z, dt);
         _motors.set_yaw(yaw_output * _pd_scale.z + _actuator_sysid.z);
-        _motors.set_yaw_ff(_adrc_rate_yaw.get_ff() * _feedforward_scalar);  // ADRC前馈项
-
-        // // 诊断日志：每 200 次循环输出一次（约 0.5 秒），如果误差大则更频繁
-        // static uint32_t log_counter = 0;
-        // // 监控 Pitch 轴误差
-        // float pitch_error = fabsf(ang_vel_body.y - gyro.y);
-
-        // // bool fast_log = pitch_error > 0.5f; // 误差超过 0.5 rad/s 时加速日志
-
-        // if (++log_counter % (fast_log ? 40 : 200) == 0) {
-        //     // 发送到地面站（QGroundControl）
-        //     // 改为监控 Pitch 轴状态
-        //     float z3_pitch = _adrc_rate_pitch.get_z3();
-            
-        //     GCS_SEND_TEXT(MAV_SEVERITY_INFO, "ADRC_PIT: t=%.2f a=%.2f out=%.2f z3=%.2f",
-        //                   (double)ang_vel_body.y, // Target
-        //                   (double)gyro.y,         // Actual
-        //                   (double)pitch_output,   // Final Output
-        //                   (double)z3_pitch);      // Disturbance Estimate
-        // }
+        _motors.set_yaw_ff(_adrc_rate_yaw.get_ff() * _feedforward_scalar);
     } else {
-        // 使用传统PID控制器
-        _motors.set_roll(get_rate_roll_pid().update_all(ang_vel_body.x, gyro.x,  dt, _motors.limit.roll, _pd_scale.x) + _actuator_sysid.x);
-        _motors.set_roll_ff(get_rate_roll_pid().get_ff());
-
-        _motors.set_pitch(get_rate_pitch_pid().update_all(ang_vel_body.y, gyro.y,  dt, _motors.limit.pitch, _pd_scale.y) + _actuator_sysid.y);
-        _motors.set_pitch_ff(get_rate_pitch_pid().get_ff());
-
-        _motors.set_yaw(get_rate_yaw_pid().update_all(ang_vel_body.z, gyro.z,  dt, _motors.limit.yaw, _pd_scale.z) + _actuator_sysid.z);
-        _motors.set_yaw_ff(get_rate_yaw_pid().get_ff()*_feedforward_scalar);
+        // Yaw - 使用 PID
+        _motors.set_yaw(get_rate_yaw_pid().update_all(ang_vel_body.z, gyro.z, dt, _motors.limit.yaw, _pd_scale.z) + _actuator_sysid.z);
+        _motors.set_yaw_ff(get_rate_yaw_pid().get_ff() * _feedforward_scalar);
     }
 
     _pd_scale_used = _pd_scale;
@@ -535,11 +547,17 @@ void AC_AttitudeControl_Multi::rate_controller_target_reset()
     _actuator_sysid.zero();
     _pd_scale = VECTORF_111;
     
-    // 如果使用ADRC，重置ADRC控制器状态
+    // 根据各轴ADRC启用标志重置对应的ADRC控制器状态
     if (_adrc_enable != 0) {
-        _adrc_rate_roll.reset();
-        _adrc_rate_pitch.reset();
-        _adrc_rate_yaw.reset();
+        if (_adrc_roll_enable != 0) {
+            _adrc_rate_roll.reset();
+        }
+        if (_adrc_pitch_enable != 0) {
+            _adrc_rate_pitch.reset();
+        }
+        if (_adrc_yaw_enable != 0) {
+            _adrc_rate_yaw.reset();
+        }
     }
 }
 
